@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 project(cs2620-pset4 CXX)
 
+# Cotamer uses C++20 `std::format`, `std::formatter`, and chrono `operator<=>`.
+# Apple Clang 14 + older Command Line Tools ship a libc++ that is incomplete for
+# those features → confusing errors in circular_int.hh, cotamer.cc, timer_heap.hh.
+# Fix: Xcode 15+ / CLT 15+, or `brew install llvm` and configure with
+#   cmake -B build -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15.0)
+    message(FATAL_ERROR
+        "Apple Clang ${CMAKE_CXX_COMPILER_VERSION} is too old for this tree "
+        "(needs full C++20 <format> and chrono <=>). "
+        "Install Xcode 15+ / Command Line Tools 15+, or use Homebrew LLVM as CMAKE_CXX_COMPILER.")
+endif()
+
 option(SAN "Enable AddressSanitizer+UBSanitizer" OFF)
 option(ASAN "Enable AddressSanitizer" OFF)
 option(UBSAN "Enable UBSanitizer" OFF)
