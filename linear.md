@@ -80,6 +80,52 @@ Implement `committed_op`, `read_ops()`, `reconstruct()`. Also write a `test_doc_
 
 ---
 
+### Chunk 2 implementation log (Kathryn, 2026-05-03)
+
+**Status: COMPLETE. All tests pass.**
+
+#### What was implemented
+
+**`doc_state.hh`** — interface in `namespace collab`:
+- `committed_op` — `pancy::version_type version`, `uint64_t client_id`, `uint64_t client_seq`, `doc_op op` (one row of replicated state per committed op).
+- `std::string op_key(doc_id, client_id, client_seq)` — builds `doc/<doc_id>/op/<client_id>/<client_seq>` so writers and tests use the same key shape.
+- `std::vector<committed_op> read_ops(const pancy::pancydb& db, std::string_view doc_id)` — collects ops for one document from a DB snapshot.
+- `std::string reconstruct(std::span<const committed_op> ops)` — replays ops in order into a single string via `apply_op`.
+- `void test_doc_state()` — exercised by `test-doc-state`; also linkable from Chunk 4’s `pt-collab --test`.
+
+**`doc_state.cc`** — implementation + tests:
+
+*Key filtering and parsing:* Keys must start with `doc/<doc_id>/op/`; the suffix must be exactly `<client_id>/<client_seq>` (one slash, decimal `uint64_t` segments via `std::from_chars`). Anything else under the prefix is skipped.
+
+*read_ops:* Iterates `db.begin()`…`end()`, deserializes values with `collab::deserialize`, attaches `vv.version` from PancyDB, then sorts by `(version, client_id, client_seq)` so replay order matches commit order on that replica view, not lexicographic key order.
+
+*reconstruct:* Starts from empty string; applies each `committed_op.op` with `apply_op` (same semantics as Chunk 1).
+
+*Tests:* `test_doc_state()` uses `CHECK` macros + `std::exit(1)` on failure. Standalone `int main()` lives in `doc_state.cc` only when `RUN_DOC_STATE_TESTS` is defined (CMake target); `test_doc_state()` body is always compiled.
+
+*Spec alignment (Chunk 2 todo vs this tree):* The checklist text says the test path is under `#ifdef RUN_DOC_STATE_TESTS`. Here that applies only to **`main`**, not to `test_doc_state()`. The function is always compiled in `doc_state.cc` so Chunk 4’s `pt-collab --test` can link the same translation unit and call `collab::test_doc_state()` without defining `RUN_DOC_STATE_TESTS` (and without two `main` symbols).
+
+#### Tests conducted (`./build/test-doc-state`)
+
+Build target: `test-doc-state` in `CMakeLists.txt` compiles `doc_state.cc` + `doc_ops.cc` with `-DRUN_DOC_STATE_TESTS` on `doc_state.cc` only (defines `main`). No Paxos, no Cotamer, no coroutines — only `pancydb` + Chunk 1 ops. `GNUmakefile` lists `test-doc-state` in `targets`.
+
+| Test | What it checks | Result |
+|---|---|---|
+| Empty DB | `read_ops` returns no rows; `reconstruct` is `""` | PASS |
+| Single insert | One key `doc/main/op/0/0`, value `I 0 hello` → text `hello`; version ≥ 1 | PASS |
+| Two sequential inserts | `I 0 ab` then `I 2 z` on same client → `abz` | PASS |
+| Version order vs key order | Client 1’s op put first, then client 0’s; lower `version` replays first → `AB` | PASS |
+| Insert then delete | `abcdef` then delete len 2 at pos 3 → `abcf` | PASS |
+| Wrong `doc_id` | Ops under `doc/other/...` invisible to `read_ops(db, "main")` | PASS |
+| Bad serialized value | Value `not an op` under valid key → row skipped, empty reconstruct | PASS |
+| Mixed keys | `docs/registry` plus one valid op → single op, text `ok` | PASS |
+
+#### Notes (behavior, not bugs)
+
+`read_ops` **skips** malformed suffixes and invalid `deserialize` results instead of throwing, so a poisoned or half-written key does not abort reconstruction. Strict invariants (contiguous `seq` per client, etc.) are left to `collab_model` / Paxos tests in later chunks.
+
+---
+
 ## Chunk 3 — Person A (4 hrs): Collaborative client model
 
 **Files:** `collab_model.hh`, `collab_model.cc`

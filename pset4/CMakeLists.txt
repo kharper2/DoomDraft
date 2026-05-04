@@ -61,6 +61,11 @@ add_library(Pancy OBJECT
 add_executable(test-doc-ops doc_ops.cc)
 target_compile_definitions(test-doc-ops PRIVATE RUN_DOC_OPS_TESTS)
 
+# Standalone doc_state test — pancydb + doc_ops only (no Cotamer when linking
+# doc_ops without RUN_DOC_OPS_TESTS; pancydb.hh pulls circular_int)
+add_executable(test-doc-state doc_state.cc doc_ops.cc)
+target_compile_definitions(test-doc-state PRIVATE RUN_DOC_STATE_TESTS)
+
 # Original Paxos test binary (unchanged from pset3 — sanity check)
 add_executable(pt-paxos
     pt-paxos.cc
