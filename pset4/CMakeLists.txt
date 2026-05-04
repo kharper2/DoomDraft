@@ -44,6 +44,10 @@ add_library(Pancy OBJECT
     utils.cc
 )
 
+# Standalone OT unit test — no Paxos, no Cotamer dependency
+add_executable(test-doc-ops doc_ops.cc)
+target_compile_definitions(test-doc-ops PRIVATE RUN_DOC_OPS_TESTS)
+
 # Original Paxos test binary (unchanged from pset3 — sanity check)
 add_executable(pt-paxos
     pt-paxos.cc

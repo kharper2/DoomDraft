@@ -10,7 +10,7 @@ ifeq ($(V),1)
 cmake_verbose := --verbose
 endif
 
-targets = pt-paxos pt-collab pt-collab-server
+targets = pt-paxos pt-collab pt-collab-server test-doc-ops
 
 all:
 	cmake -B $(BUILD) $(cmake_build)
