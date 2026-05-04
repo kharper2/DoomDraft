@@ -52,21 +52,27 @@ add_executable(pt-paxos
 )
 
 # Simulation-based collaborative editor test (Person A)
-add_executable(pt-collab
-    pt-collab.cc
-    doc_ops.cc
-    doc_state.cc
-    collab_model.cc
-    $<TARGET_OBJECTS:Cotamer>
-    $<TARGET_OBJECTS:Pancy>
-)
+# Becomes active once doc_ops.cc, doc_state.cc, collab_model.cc, pt-collab.cc exist
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pt-collab.cc)
+    add_executable(pt-collab
+        pt-collab.cc
+        doc_ops.cc
+        doc_state.cc
+        collab_model.cc
+        $<TARGET_OBJECTS:Cotamer>
+        $<TARGET_OBJECTS:Pancy>
+    )
+endif()
 
 # HTTP server + collaborative editor (Person B)
-add_executable(pt-collab-server
-    pt-collab-server.cc
-    doc_ops.cc
-    doc_state.cc
-    http_server.cc
-    $<TARGET_OBJECTS:Cotamer>
-    $<TARGET_OBJECTS:Pancy>
-)
+# Becomes active once http_server.cc and pt-collab-server.cc exist
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pt-collab-server.cc)
+    add_executable(pt-collab-server
+        pt-collab-server.cc
+        doc_ops.cc
+        doc_state.cc
+        http_server.cc
+        $<TARGET_OBJECTS:Cotamer>
+        $<TARGET_OBJECTS:Pancy>
+    )
+endif()
