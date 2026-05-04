@@ -1,14 +1,27 @@
 # CS 2620 Pset 4: Collaborative Document Editing on Paxos
 
-**Ambition**: 4.5/5  
-**Team**: 2 people (~15 hours each, ~30 hours total)  
-**Deadline**: May 6 (demo), May 13 (final)
+**Ambition:** 4/5 in the handout sense (“application on Paxos + failures”); this plan aims at the **upper end** of that band (full OT in sim + optional browser demo).  
+**Team:** 2 people (~15 hours each — treat as a **lower bound**; scope below is aggressive).  
+**Deadline:** May 6 (demo), May 13 (final)
+
+**Roles**
+
+- **Aengus:** Paxos-side integration, `collab_model`, `pt-collab`, OT core + simulation failure campaign.
+- **Kathryn:** HTTP/SSE API, `pt-collab-server`, browser client, demo polish.
+
+**Scope tiers (use this when time runs short):**
+
+1. **Tier 1 — assignment-critical:** Simulation harness + OT/unit tests + randomized diamond check + `pt-collab` with failure schedules + **pairwise same reconstructed text on every live replica** after each seed. No browser required.
+2. **Tier 2 — planned demo:** HTTP + SSE + single doc + two browser tabs + basic failover story.
+3. **Tier 3 — stretch:** Cursors/presence, multi-document registry, full `collab-bench.sh` matrix at large `-R`. Cut tier 3 first, then trim tier 2 to curl-only if needed.
+
+**Single source of truth:** This repo uses **only** `PROJECT_PLAN.md` for planning (no second planning file — avoids drift and “which doc is right?”).
 
 ---
 
 ## One-paragraph description
 
-Build a Google Docs–style collaborative text editor backed by the existing Paxos implementation. The system has two distinct layers. The **backend** (Person A) is a simulation-based test harness: multiple simulated editors submit character-level insert/delete operations through Paxos, which imposes a total order on all ops; Operational Transformation (OT) on the client side reconciles each editor's pending local edits against remotely committed ops; a `collab_model::check()` function verifies that all live replicas converge to identical document text under every failure schedule (failover, split-brain, partition, torture). The **frontend** (Person B) is a real HTTP/EventSource server that exposes the Paxos backend as a web API, with a browser-based editor where multiple real users can collaboratively edit in real-time over HTTP, with cursor/presence tracking and a document registry. The combination of rigorous simulation-based correctness testing and a working real-world deployment is what pushes this to the upper end of Ambition 4.
+Build a Google Docs–style collaborative text editor backed by the existing Paxos implementation. The system has two distinct layers. The **backend** (Aengus) is a simulation-based test harness: multiple simulated editors submit character-level insert/delete operations through Paxos, which imposes a total order on all ops; Operational Transformation (OT) on the client side reconciles each editor's pending local edits against remotely committed ops; a `collab_model::check()` function verifies that all live replicas converge to identical document text under every failure schedule (failover, split-brain, partition, torture). The **frontend** (Kathryn) is a real HTTP/EventSource server that exposes the Paxos backend as a web API, with a browser-based editor where multiple real users can collaboratively edit in real-time over HTTP, with cursor/presence tracking and a document registry. The combination of rigorous simulation-based correctness testing and a working real-world deployment is what pushes this to the upper end of Ambition 4.
 
 ---
 
@@ -31,7 +44,13 @@ OT's hard part is establishing a total order for concurrent operations. Paxos al
 | `doc/<id>/cursor/<client_id>` | serialized cursor position | Each editor client |
 | `docs/registry` | JSON list of doc IDs | Document creation |
 
-Document text is **never stored directly** — it is reconstructed by iterating all `doc/<id>/op/*` keys, sorting by PancyDB `version` (which equals the Paxos commit slot), and replaying ops in order. This gives deterministic reconstruction on every live replica.
+Document text is **never stored directly** — it is reconstructed by iterating all `doc/<id>/op/*` keys, sorting by a **per-replica commit order** you can rely on (see below), and replaying ops in order. This gives deterministic reconstruction on every live replica.
+
+**Verify in the real codebase (do not assume from this doc alone):**
+
+- **Total order key:** Confirm whether `pancy::version_type` (or whatever PancyDB exposes) is a **single global sequence** aligned with Paxos log order for all keys. If not, store an explicit **log index / slot** in the value or use one ordered namespace so “sort for replay” matches **true commit order**.
+- **Iteration:** Confirm you can **list keys by prefix** (`doc/<id>/op/…`) efficiently; if not, switch layout (e.g. one append-only key per slot).
+- **Leader reads (Kathryn / HTTP path):** Any “read the leader’s DB” path must use the **same leader discovery / redirect** behavior as the rest of the Paxos client stack after failover, or you can read stale state.
 
 Op serialization format:
 - Insert: `I <pos> <text>` e.g. `I 5 hello`
@@ -49,9 +68,9 @@ Op serialization format:
 
 ---
 
-## Person A: Backend, simulation, and testing (~15 hours)
+## Aengus: Backend, simulation, and testing (~15 hours)
 
-**Owner**: correctness of the OT engine, simulation-based test harness, failure testing campaign.
+**Owner (Aengus):** correctness of the OT engine, simulation-based test harness, failure testing campaign.
 
 ### Files
 
@@ -189,29 +208,13 @@ loop:
   4. co_await cotamer::after(random 1–20ms).
 ```
 
-**`check()` logic:**
+**`check()` vs cross-replica convergence (keep the invariant obvious):**
 
-```cpp
-std::optional<std::string> collab_model::check(const pancy::pancydb& db) {
-    auto ops = collab::read_ops(db, doc_id_);
-    if (ops.empty()) return std::nullopt;  // nothing committed yet is fine
-    // Verify op sequence has no gaps (every client_seq is contiguous)
-    // Verify all ops are valid (non-negative positions, lengths in-bounds)
-    auto text = collab::reconstruct(ops);
-    // Store expected_text_ on first call; compare on subsequent calls
-    if (expected_text_.empty()) {
-        expected_text_ = text;
-        return std::nullopt;
-    }
-    if (text != expected_text_) {
-        return std::format("document mismatch: expected {} chars, got {}",
-                           expected_text_.size(), text.size());
-    }
-    return std::nullopt;
-}
-```
+- **`collab_model::check(db)` (per-replica):** Use this for **local** invariants on that replica’s view: e.g. no illegal ops (positions/lengths in range), optional per-client `seq` gap detection, deserialize errors. Avoid a fuzzy pattern like “first `check()` sets golden `expected_text_`” unless you clearly define what that means across replicas.
+- **`try_one_seed()` in `pt-collab.cc` (canonical):** After steps / schedules, for **every pair of live replicas** `(i, j)`, compute `text_i = reconstruct(read_ops(db_i, doc_id))` and `text_j = reconstruct(...)` and **`assert(text_i == text_j)`**. That is the **real** convergence guarantee for the writeup and grading.
+- Optional: also assert `text_i` equals a **reference simulation** (single-threaded replay of the same committed op sequence) if you have one — catches ordering bugs in `read_ops`.
 
-Cross-replica convergence is checked in `try_one_seed()` in `pt-collab.cc`, which calls `collab::reconstruct()` on each live replica's DB and asserts all results match.
+Cross-replica checks must **not** depend on the order in which `check()` happens to be called on different replicas unless you document a single shared oracle (usually unnecessary — use pairwise equality in `try_one_seed()`).
 
 ### Phase A4 — Binary and test campaign (2 hours)
 
@@ -240,9 +243,9 @@ Track: what broke, what surprising behaviors emerged, interesting seeds.
 
 ---
 
-## Person B: HTTP server, browser UI, real-world demo (~15 hours)
+## Kathryn: HTTP server, browser UI, real-world demo (~15 hours)
 
-**Owner**: real-world deployment, HTTP API, browser-based collaborative editor, cursor/presence, multiple documents.
+**Owner (Kathryn):** real-world deployment, HTTP API, browser-based collaborative editor, cursor/presence, multiple documents.
 
 ### Files
 
@@ -399,32 +402,100 @@ Track: what SSE edge cases arose, how cursor tracking under OT was handled, inte
 
 ## Integration and joint work
 
-### What both people do together (fits within individual hour budgets)
+### Work order checklist
 
-- **Joint design session** (1 hour): agree on op serialization format and API contract before coding.
-- **Integration testing** (1 hour): run `pt-collab-server` + browser against the simulation's `pt-collab` correctness tests on the same document.
-- **Cross-check OT**: verify JS `transform()` and C++ `transform()` produce identical results on the same test vectors.
-- **Writeup** (each writes their own, ~3 hours each): Person A covers the OT + consensus sections; Person B covers the HTTP/deployment/demo sections. Both sections reference each other.
+Check boxes when that person’s part is **done and merged** (or tick **N/A** in chat if you skip an item). Steps are mostly **sequential**; read each step’s **gate** before starting.
 
-### Dependency order
+---
 
-```
-Person A starts here        Person B starts here
-      |                           |
-  doc_ops.hh (A1)          API design (B1)   ← can be parallel
-      |                           |
-  doc_state (A2)           http_server (B2)  ← B2 needs doc_ops.hh
-      |                           |
-  collab_model (A3)        editor.js (B3)    ← can be parallel after API settled
-      |                           |
-  pt-collab.cc (A4)        pt-collab-server (B6)  ← B6 needs pt_paxos_instance
-      |                           |
-  Test campaign (A4)       Cursor support (B4) ← parallel
-      |                           |
-  Lab notebook (A5)        Multi-doc (B5)    ← parallel
-```
+#### Step 0 — Contract (both)
 
-Person B can start on B1 and B3 (API design + JS OT logic) before any of Person A's code is ready. Person B needs `doc_ops.hh` for the serialization format (available after A1, ~day 1 afternoon).
+*Gate: none.*
+
+- [ ] **Both:** Agreed **op string format** (e.g. `I <pos> <text>`, `D <pos> <len>`, plus any cursor line if you use it).
+- [ ] **Both:** Sketched **HTTP routes** (paths, JSON fields, `client_id` / `seq` / `version` semantics) — enough that step 2 API spec is not vague.
+
+---
+
+#### Step 1 — `doc_ops` (Aengus)
+
+*Gate: step 0 done.*
+
+- [ ] **Aengus:** `doc_ops.hh` / `doc_ops.cc`: types, `serialize` / `deserialize`, `apply`, `transform`.
+- [ ] **Aengus:** Unit tests wired (e.g. `./pt-collab --test` or your chosen binary) including **randomized diamond / commutativity** check when ready.
+
+---
+
+#### Step 2 — Parallel track
+
+*Gate: **Aengus** — after step 1. **Kathryn (API only)** — after step 0. **Kathryn (`editor.js` / match `doc_ops`)** — after step 1.*
+
+- [ ] **Aengus:** `doc_state.hh` / `doc_state.cc`: `read_ops`, `reconstruct` (or equivalent).
+- [ ] **Kathryn:** **HTTP API spec** written down (B1): paths, request/response JSON, errors) — can finish **without** waiting for Aengus code.
+- [ ] **Kathryn:** **`editor.js`** OT / tests **or** any code that must **match `doc_ops`** — only after **`doc_ops.hh` exists** (step 1).
+
+---
+
+#### Step 3 — Simulated clients (Aengus)
+
+*Gate: Aengus step 2 (`doc_state`) usable.*
+
+- [ ] **Aengus:** `collab_model` + editor coroutines (simulated editors → Paxos).
+- [ ] **Aengus:** Sanity: sim clients commit ops and **reconstruct** matches expectations (manual or test).
+
+---
+
+#### Step 4 — Sim binary ∥ HTTP layer
+
+*Gate: **Kathryn** C++ that `#include`s `doc_ops` — after step 1. **Kathryn** deep replica wiring — after step 3 if you need Aengus’s running layout. **Aengus** — after step 3.*
+
+- [ ] **Aengus:** `pt-collab.cc` + failure schedules; **pairwise reconstruct** across live replicas in harness.
+- [ ] **Kathryn:** `http_server` / `doc_http` (B2): handlers + Paxos client path (redirects / leader as needed).
+
+---
+
+#### Step 5 — Combined server binary (Kathryn)
+
+*Gate: Aengus has a **runnable** Paxos + apply path you can call (steps 3–4).*
+
+- [ ] **Kathryn:** `pt-collab-server` (B6): replicas + HTTP; smoke **two tabs** or curl.
+- [ ] **Kathryn:** Document in README how to start (ports, # replicas).
+
+---
+
+#### Step 6 — Hardening & stretch
+
+*Gate: step 4–5 basically working.*
+
+- [ ] **Aengus:** `collab-bench.sh` / seed campaign / extra failure modes as planned.
+- [ ] **Kathryn:** Cursors / presence (B4) — *optional if time.*
+- [ ] **Kathryn:** Multi-document registry (B5) — *optional if time.*
+
+---
+
+#### Step 7 — Integration (both)
+
+*Gate: steps 4–6 far enough that sim + server can run against same contract.*
+
+- [ ] **Both:** Session: `pt-collab-server` + browser (or curl) **and** `pt-collab` sim on aligned behavior.
+- [ ] **Both:** **Shared OT vectors:** same inputs → C++ `transform` and JS `transform` agree (script or documented manual vectors).
+- [ ] **Both:** Demo path agreed (what you show for class / writeup).
+
+---
+
+### Joint tasks checklist (throughout / end)
+
+*These are not strictly one step; tick when done.*
+
+- [ ] **Both:** Joint design session done (can be the same work as step 0 — don’t double-count unless you did a second pass).
+- [ ] **Aengus:** Lab notebook / backend notes caught up for writeup.
+- [ ] **Kathryn:** Lab notebook / frontend notes caught up for writeup.
+- [ ] **Aengus:** Own **4–6 page** writeup draft (OT, Paxos, testing).
+- [ ] **Kathryn:** Own **4–6 page** writeup draft (HTTP, demo, protocol).
+
+---
+
+**Rule of thumb:** Kathryn can finish the **API spec** after **step 0** only. Code that **`#include`s `doc_ops.hh`** or JS that must **match** `serialize` / `transform` waits for **step 1**. **Live Paxos** in the server waits on Aengus through roughly **steps 3–5**.
 
 ---
 
@@ -432,17 +503,17 @@ Person B can start on B1 and B3 (API design + JS OT logic) before any of Person 
 
 ```
 pset3/
-  doc_ops.hh / doc_ops.cc          ← Person A
-  doc_state.hh / doc_state.cc      ← Person A
-  collab_model.hh / collab_model.cc ← Person A
-  pt-collab.cc                     ← Person A
-  collab-bench.sh                  ← Person A
-  http_server.hh / http_server.cc  ← Person B
-  doc_http.hh / doc_http.cc        ← Person B
-  pt-collab-server.cc              ← Person B
+  doc_ops.hh / doc_ops.cc          ← Aengus
+  doc_state.hh / doc_state.cc      ← Aengus
+  collab_model.hh / collab_model.cc ← Aengus
+  pt-collab.cc                     ← Aengus
+  collab-bench.sh                  ← Aengus
+  http_server.hh / http_server.cc  ← Kathryn
+  doc_http.hh / doc_http.cc        ← Kathryn
+  pt-collab-server.cc              ← Kathryn
   static/
-    editor.html                    ← Person B
-    editor.js                      ← Person B
+    editor.html                    ← Kathryn
+    editor.js                      ← Kathryn
   CMakeLists.txt                   ← both (add two new targets)
 ```
 
@@ -452,13 +523,13 @@ All of `pancydb`, `netsim`, `client_model`, `pt_paxos_replica`, `cotamer`, `lock
 
 ## What "done" looks like
 
-**Simulation (Person A):**
+**Simulation (Aengus):**
 - `./pt-collab --test` passes all OT unit tests including the randomized diamond property check.
 - `./pt-collab -R 500` passes with no divergence.
 - `./pt-collab -f failover`, `-f split`, `-f torture` all pass.
 - `./pt-collab -l 0.15 -R 100` passes (high-loss correctness).
 
-**Real-world (Person B):**
+**Real-world (Kathryn):**
 - `./pt-collab-server --port 8080` starts.
 - Two browser tabs on the same document show each other's edits in real time.
 - Cursor positions update live.
@@ -472,12 +543,12 @@ All of `pancydb`, `netsim`, `client_model`, `pt_paxos_replica`, `cotamer`, `lock
 | Section | Owner |
 |---|---|
 | Introduction: collaborative editing problem | joint |
-| Background: OT, Jupiter model, Paxos-as-sequencer | Person A |
-| System design: data model, API, protocol | Person B |
-| OT implementation: transform rules, correctness proof sketch | Person A |
-| HTTP/SSE server and browser client | Person B |
-| Testing: simulation-based, failure schedules, seed campaign | Person A |
-| Demo: real-world deployment and failure demo | Person B |
+| Background: OT, Jupiter model, Paxos-as-sequencer | Aengus |
+| System design: data model, API, protocol | Kathryn |
+| OT implementation: transform rules, correctness proof sketch | Aengus |
+| HTTP/SSE server and browser client | Kathryn |
+| Testing: simulation-based, failure schedules, seed campaign | Aengus |
+| Demo: real-world deployment and failure demo | Kathryn |
 | Discussion: limitations, future work (CRDT, GOT for undo) | joint |
 | References | joint |
 
@@ -488,7 +559,7 @@ All of `pancydb`, `netsim`, `client_model`, `pt_paxos_replica`, `cotamer`, `lock
 | Decision | Choice | Rationale |
 |---|---|---|
 | OT vs CRDT | OT (Jupiter model) | OT simpler to implement correctly; CRDT (Yjs-style) needs char IDs + tombstones — good future work |
-| Sequencing mechanism | Paxos commit slot (PancyDB version) | Free from existing infrastructure; no extra coordination needed |
+| Sequencing mechanism | Paxos log order (may be reflected as PancyDB `version` **if** that matches global commit order — **confirm**) | Must match true commit order for replay; add explicit slot in op value if needed |
 | Document storage | Op log in KV store, text reconstructed | Avoids hot-key CAS contention; gives full history for free |
 | SSE vs WebSockets | SSE for server→client, HTTP POST for client→server | SSE fits Cotamer's HTTP model; full WebSockets harder to add, lower priority |
 | Browser OT | JS port of C++ transform() | Cross-checks the C++ logic; no JS library dependency |
@@ -502,6 +573,42 @@ All of `pancydb`, `netsim`, `client_model`, `pt_paxos_replica`, `cotamer`, `lock
 |---|---|
 | OT transform bugs | Randomized diamond-property test (A1 test 7) catches these fast |
 | JS and C++ OT diverge | Run same test vectors through both; script this check |
-| HTTP server integration takes longer than expected | Person B can demo with curl instead of browser if needed |
+| HTTP server integration takes longer than expected | Kathryn can demo with curl instead of browser if needed |
 | Cotamer HTTP API is unfamiliar | Read existing HTTP handout code first; B1 (API design) is a safe first step |
-| Running out of time | Simulation (Person A) is the mandatory core; HTTP + browser (Person B) is the "ambitious" layer. Can cut multi-doc if needed. |
+| Running out of time | Follow **Scope tiers** above: ship Tier 1 first. Cut Tier 3 (cursors, multi-doc, huge `-R`), then shrink Tier 2 (curl-only demo, or static page without full OT in JS if you must). |
+
+---
+
+## Appendix: Course checklist, references, milestones
+
+### Course checklist (reminder)
+
+- **Track:** Application on Paxos (≈ ambition **4/5**): collaborative editing + **failure handling**.
+- **Mandatory:** Automated tests; failures affecting **≥1 component**; define what “committed” means in tests.
+- **Turnin:** Code, lab notebook, **4–6 page** writeup (Markdown or PDF) **per student**.
+- **Groups:** Instructor **pre-approval** required; max 3.
+- **Repo:** [github.com/kharper2/DoomDraft](https://github.com/kharper2/DoomDraft)
+
+### References (related work — not a checklist to implement)
+
+| Topic | Link |
+|--------|------|
+| Eg-walker | [arXiv:2409.14252](https://arxiv.org/pdf/2409.14252) |
+| Differential synchronization | [neil.fraser.name/writing/sync](https://neil.fraser.name/writing/sync) |
+| Jupiter | [ACM](https://dl.acm.org/doi/10.1145/215585.215706) |
+| Yjs | [yjs.dev](https://yjs.dev) |
+| Critiques / collab editing | [Moment part 1](https://www.moment.dev/blog/lies-i-was-told-pt-1), [part 2](https://www.moment.dev/blog/lies-i-was-told-pt-2) |
+
+### Coarse milestones (assignment bar)
+
+Use these as a sanity check alongside the detailed phases above:
+
+- [ ] **A:** One client, full replica set, no failures → N ops → identical reconstructed text on all replicas.
+- [ ] **B:** Two clients (or two simulated editors), no failures → interleaved ops → identical text everywhere.
+- [ ] **C:** At least one **failure** model (crash/restart, partition, loss/delay per harness) → still identical survivors + no lost committed ops (per your definition).
+
+### Open questions (fill in)
+
+1. Topology: # replicas, how clients attach.
+2. Idempotency / client `seq` if retries can duplicate proposals.
+3. Instructor group approval: confirmed? Date?
