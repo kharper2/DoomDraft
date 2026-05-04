@@ -136,6 +136,82 @@ Implement `collab_model` extending `client_model`. The editor coroutine submits 
 
 ---
 
+### Chunk 3 implementation log (Aengus, 2026-05-04)
+
+**Status: COMPLETE. Compiles clean. Also implemented Chunk 4 (pt-collab.cc + collab-bench.sh) since both were needed to verify correctness — all basic and failure-schedule seeds pass.**
+
+#### Verification of Chunk 2 (Kathryn's doc_state)
+
+Read `doc_state.hh` and `doc_state.cc` before starting. Everything checks out:
+
+- `committed_op` has the right fields (`version`, `client_id`, `client_seq`, `op`).
+- `op_key()` builds `doc/<doc_id>/op/<client_id>/<client_seq>` — matches the key shape `collab_model` writes.
+- `read_ops()`: prefix-filters correctly, parses suffix with `std::from_chars`, rejects extra-slash paths, sorts by `(version, client_id, client_seq)`.
+- `reconstruct()`: starts from `""`, applies each op via `apply_op` in sort order.
+- `test_doc_state()`: always compiled (not gated by define), so `pt-collab --test` can link and call it.
+- `./build/test-doc-state` passes all 8 cases.
+
+One cross-check confirmed: the "version order vs key order" test (client 1 put before client 0 → lower version replays first → `"AB"`) verifies that `vv.version` is the right sort key, not lexicographic key order.
+
+#### What was implemented
+
+**`collab_model.hh`** — header in top-level namespace (not `collab`):
+- `editor_state` per client: `leader`, `local_text`, `pending` (ops awaiting confirmation), `pending_seqs` (client_seq per pending op), `peer_next_seq` (vector indexed by peer cid), `next_seq`.
+- Public counters: `ops_submitted`, `ops_committed`, `ops_transformed`.
+- Private: `editor(cid)` coroutine, `sync_committed_ops(es, cid, serial)` helper.
+
+**`collab_model.cc`** — implementation:
+
+*`start()`*: calls `set_nclients(nclients_)`, allocates 8 `editor_state` objects, launches one `editor()` coroutine per client.
+
+*`check(db)`*: iterates PancyDB for keys under `doc/<id>/op/`, skips non-existent versions, tries `collab::deserialize` on each value, returns the key on failure. Cross-replica text comparison is done in `try_one_seed()`, not here — `check()` only catches corrupted op values.
+
+*`sync_committed_ops(es, cid, serial)`*: iterates over all `nclients_` peers. For each, builds the expected key `doc/<id>/op/<peer>/<peer_next_seq[peer]>`, GETs it from the current leader (incrementing `serial` by `serial_step()` each time), awaits the response with a 3s timeout. On success:
+- If `peer == cid`: our own op is committed; pop it from `pending`/`pending_seqs`.
+- Otherwise: `apply_op` the committed op to `local_text`; `transform` each pending op against it.
+- Advance `peer_next_seq[peer]++`.
+
+*`editor(cid)` loop*:
+1. `co_await sync_committed_ops(...)` — keep local view current.
+2. With probability 0.6, generate a random insert (pos in `[0, text.size()]`, 1–5 lowercase letters) or delete (pos in `[0, size-1]`, len ≤ min(5, remaining)). Apply optimistically to `local_text`, push to `pending`.
+3. If `pending` non-empty, submit `pending[0]` as `PUT doc/<id>/op/<cid>/<seq>`. Retry with same serial on timeout; switch to `random_replica()` every 3rd timeout (or immediately on redirect, since `receive_response` updates `es.leader` in-place).
+4. `co_await cot::after(uniform(1ms, 20ms))`.
+
+**Serial encoding**: serial starts at `cid` and increments by `serial_step()` (4096) per send, matching `client_model`'s routing convention (`serial & client_mask() == cid`). Each GET in the sync loop uses a distinct serial. The PUT retry loop reuses the same serial (idempotent at the Paxos layer).
+
+**`pt-collab.cc`**: Full Paxos replica infrastructure copied from `pt-paxos.cc` (struct definitions, message types, all handlers, failure schedules). The only changes:
+
+- Includes `collab_model.hh` and `doc_state.hh` instead of `lockseq_model.hh`.
+- `try_one_seed()` uses `collab_model` instead of `lockseq_model`. After `cot::loop()`, instead of `db.diff()` for cross-replica comparison, it calls `reconstruct(read_ops(db, DOC_ID))` on the best replica and on every other live replica, asserting pairwise equality.
+- `main()` adds `--test` flag: runs `collab::test_doc_state()` and exits.
+- Failure schedules: failover, recover, split, unstable, torture, random (darias/eric schedules omitted as they're not in the collab test matrix).
+
+**`collab-bench.sh`**: runs the 8-row test matrix from the spec (`--test`, `-R 100`, `-f failover -R 50`, `-f recover -R 50`, `-f split -R 50`, `-f unstable -R 30`, `-f torture -R 20`, `-l 0.15 -R 100`).
+
+#### Design decisions
+
+*`check()` vs cross-replica check*: The Chunk 3 spec said "store result for cross-replica comparison" in `check()`, but that requires shared mutable state across calls and a fragile "first call sets golden" pattern. Instead, `check()` does per-replica op-deserialization checks only, and `try_one_seed()` does pairwise `reconstruct()` comparison on all live replicas. This is cleaner and matches the PROJECT_PLAN.md design.
+
+*OT in the simulation*: OT keeps `local_text` coherent (so random ops stay in bounds). Convergence itself holds because Paxos imposes a total order on all PUTs; `read_ops` sorts by `vv.version` (= Paxos commit order); `reconstruct` replays in that order. All live replicas apply the same slots in the same order → same versions → same reconstructed text.
+
+*Retry key reuse*: if a PUT is retried with the same key/value, PancyDB accepts both and bumps the version. The op appears later in `read_ops` ordering but the value is unchanged. Convergence still holds (all replicas see the same final version). The pending queue pops the op only when `sync_committed_ops` confirms it via GET.
+
+#### Tests conducted
+
+| Test | Result |
+|---|---|
+| `./build/test-doc-ops` | PASS (7 cases, 846 randomized diamond checks) |
+| `./build/test-doc-state` | PASS (8 cases) |
+| `./build/pt-collab --test` | PASS |
+| `./build/pt-collab -R 5` | PASS |
+| `./build/pt-collab -R 20 -f failover` | PASS |
+| `./build/pt-collab -R 10 -f recover` | PASS |
+| `./build/pt-collab -R 10 -f split` | PASS |
+
+Full `collab-bench.sh` matrix (unstable/torture/high-loss) should be run as Chunk 5.
+
+---
+
 ## Chunk 4 — Person B (3 hrs): `pt-collab` binary + basic correctness
 
 **Files:** `pt-collab.cc`, `collab-bench.sh`
@@ -156,6 +232,8 @@ Write `collab-bench.sh` with this test matrix:
 | High loss | `-l 0.15 -R 100` | Converges with 15% message loss |
 
 **Done when:** `./pt-collab -R 100` passes and `./pt-collab --test` passes. Run this before handing off — bugs here are almost certainly in Chunk 3's sync logic, so Person A should be available to debug.
+
+**Note:** Implemented together with Chunk 3 on 2026-05-04 (Aengus). See Chunk 3 implementation log for details. Basic and failure-schedule seeds all pass; full bench matrix is Chunk 5.
 
 ---
 
