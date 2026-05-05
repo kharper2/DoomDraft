@@ -985,6 +985,8 @@ static struct option options[] = {
     {"test",         no_argument,       nullptr, 't'},
     {nullptr, 0, nullptr, 0}};
 
+#ifndef PT_COLLAB_SERVER
+
 int main(int argc, char* argv[]) {
   testinfo tester;
   std::optional<unsigned long> first_seed;
@@ -1043,3 +1045,79 @@ int main(int argc, char* argv[]) {
   }
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
+
+#endif // !PT_COLLAB_SERVER
+
+// ---------------------------------------------------------------------------
+// Server main: pt-collab-server. Starts a 3-replica Paxos cluster (no
+// failures, no message loss) inside the same cot::loop as a real-time HTTP
+// server (see http_server.{hh,cc}). HTTP handlers submit puts through one
+// reserved simulated client; reads come straight from the leader's pancydb.
+// ---------------------------------------------------------------------------
+
+#ifdef PT_COLLAB_SERVER
+#include "http_server.hh"
+
+static struct option server_options[] = {
+    {"port",     required_argument, nullptr, 'p'},
+    {"replicas", required_argument, nullptr, 'n'},
+    {"doc",      required_argument, nullptr, 'd'},
+    {nullptr, 0, nullptr, 0}};
+
+int main(int argc, char* argv[]) {
+  uint16_t port = 8080;
+  size_t nreplicas = 3;
+  std::string doc_id = "main";
+
+  auto shortopts = short_options_for(server_options);
+  int ch;
+  while ((ch = getopt_long(argc, argv, shortopts.c_str(), server_options, nullptr)) != -1) {
+    if (ch == 'p') {
+      port = static_cast<uint16_t>(from_str_chars<unsigned>(optarg));
+    } else if (ch == 'n') {
+      nreplicas = from_str_chars<size_t>(optarg);
+    } else if (ch == 'd') {
+      doc_id = optarg;
+    } else {
+      std::print(std::cerr, "Usage: pt-collab-server [--port N] [--replicas N] [--doc ID]\n");
+      return 1;
+    }
+  }
+
+  cot::set_clock(cot::clock::real_time);
+
+  testinfo tester;
+  tester.loss = 0.0;
+  tester.nreplicas = nreplicas;
+  tester.failure_schedule = failure_schedule_kind::none;
+  tester.randomness.seed(0xD00Du);
+
+  http_client_model client(tester.nreplicas, tester.randomness);
+  pt_paxos_instance inst(tester, client);
+  client.start();
+
+  std::vector<cot::task<>> replica_tasks;
+  replica_tasks.reserve(tester.nreplicas);
+  for (size_t s = 0; s != tester.nreplicas; ++s) {
+    replica_tasks.push_back(inst.replicas[s]->run());
+  }
+
+  http_paxos_bridge bridge;
+  bridge.doc_id = doc_id;
+  bridge.client = &client;
+  bridge.current_db = [&inst, &client]() -> const pancy::pancydb& {
+    size_t leader = client.leader_index();
+    if (leader >= inst.replicas.size()) leader = 0;
+    return inst.replicas[leader]->db_;
+  };
+
+  cot::task<> http_task = run_http_server(port, std::move(bridge));
+
+  std::print("DoomDraft server: doc=\"{}\" replicas={} listening on http://localhost:{}\n",
+             doc_id, tester.nreplicas, port);
+
+  cot::loop();
+  return 0;
+}
+
+#endif // PT_COLLAB_SERVER

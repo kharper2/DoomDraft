@@ -86,15 +86,18 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pt-collab.cc)
     )
 endif()
 
-# HTTP server + collaborative editor (Person B)
-# Becomes active once http_server.cc and pt-collab-server.cc exist
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/pt-collab-server.cc)
+# HTTP server: same pt-collab.cc compiled with PT_COLLAB_SERVER selects a
+# server `main` (real-time clock + HTTP listen loop) instead of the
+# simulation harness. http_server.cc adds the HTTP/SSE layer.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/http_server.cc)
     add_executable(pt-collab-server
-        pt-collab-server.cc
+        pt-collab.cc
         doc_ops.cc
         doc_state.cc
+        collab_model.cc
         http_server.cc
         $<TARGET_OBJECTS:Cotamer>
         $<TARGET_OBJECTS:Pancy>
     )
+    target_compile_definitions(pt-collab-server PRIVATE PT_COLLAB_SERVER)
 endif()

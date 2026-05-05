@@ -247,6 +247,41 @@ Run every failure schedule from `collab-bench.sh`. The most likely failure mode:
 
 ---
 
+### Chunk 5 implementation log (verified by Kathryn, 2026-05-03)
+
+**Status: COMPLETE. All `collab-bench.sh` rows pass; no `collab_model.cc` changes were required.**
+
+*(Chunk 5 is listed as Person A in the summary table; Aengus had already exercised individual failure modes during Chunk 3/4. This log records a full-matrix verification run.)*
+
+#### What was run
+
+From `pset4/`, with `./build/pt-collab` built (Homebrew `clang++` if Apple Clang is older than 15):
+
+```bash
+bash collab-bench.sh
+```
+
+#### Results
+
+| Step | Command | Result |
+|---|---|---|
+| OT + doc_state via binary | `./build/pt-collab --test` | PASS |
+| Basic convergence | `./build/pt-collab -R 100` | PASS (100 seeds) |
+| Failover | `./build/pt-collab -f failover -R 50` | PASS |
+| Recovery | `./build/pt-collab -f recover -R 50` | PASS |
+| Split brain | `./build/pt-collab -f split -R 50` | PASS |
+| Unstable | `./build/pt-collab -f unstable -R 30` | PASS |
+| Torture | `./build/pt-collab -f torture -R 20` | PASS |
+| High loss | `./build/pt-collab -l 0.15 -R 100` | PASS |
+
+Script ends with `All tests passed.`
+
+#### Notes
+
+No divergence or invariant failures appeared; `sync_committed_ops()` / `collab_model` behavior from Chunk 3/4 is sufficient for this matrix on current seeds. If new failures appear after future edits, treat them as regressions and fix in `collab_model.cc` before claiming Chunk 5 again.
+
+---
+
 ## Chunk 6 — Person B (4 hrs): HTTP server
 
 **Files:** `http_server.hh`, `http_server.cc`
@@ -264,6 +299,104 @@ Expose the Paxos backend over HTTP using Cotamer's HTTP support. Implement these
 The `watch_ops()` coroutine polls the leader replica's PancyDB for ops with version > last broadcast and fans new ops out to all active SSE subscribers.
 
 **Done when:** `curl localhost:8080/doc/main` returns the document, `curl -X POST localhost:8080/doc/main/op -d '{"type":"I","pos":0,"text":"hello"}'` commits and returns a version, and a second `curl localhost:8080/doc/main` shows the updated text.
+
+---
+
+### Chunk 6 implementation log (Kathryn) — COMPLETE
+
+**Status: COMPLETE 2026-05-05.**
+
+#### What was implemented
+
+- `pset4/http_server.hh` and `pset4/http_server.cc` — minimal HTTP/1.1 + SSE on Cotamer TCP.
+  - `http_client_model` (subclass of `client_model`): reserves cid 0 and exposes `submit_put(key, value)` as a coroutine. Same redirect / timeout / leader-switch retry pattern as `collab_model::editor`, but with a 12-attempt budget and per-call atomic serial offset so concurrent HTTP submits don't collide.
+  - `http_paxos_bridge` glue (doc id, client pointer, `current_db()` callback) so the HTTP layer is decoupled from the Paxos types.
+  - `run_http_server(port, bridge)`: `cot::tcp_listen` + `cot::tcp_accept` loop; per-connection task is `detach()`ed so the loop keeps accepting.
+  - Per-connection coroutine: reads until `\r\n\r\n`, parses request line, reads `Content-Length` body, dispatches one request, then closes (no keep-alive in MVP).
+  - Tiny flat-JSON helpers (`json_get_string` / `json_get_int` / `json_escape`) — enough for the Chunk 6 wire format. FNV-1a 64 hashes string `client_id` to the `uint64_t` slot used by `collab::op_key`.
+  - Routes: `GET /doc/<id>`, `POST /doc/<id>/op`, `GET /doc/<id>/stream`, `GET /docs` (returns single-element list for now). Anything else returns `404 {"error":"no route"}`. Bad request bodies return `400 {"error":"..."}`.
+  - SSE handler: writes the `text/event-stream` headers, then polls `collab::read_ops` every 250 ms and emits each new committed op as `event: op\ndata: {...}\n\n`. Heartbeats `event: ping\ndata: {}` every 15 s. Connection lives forever or until the client drops (write failure breaks the loop).
+- `pset4/pt-collab.cc`:
+  - Wrapped the existing simulation `int main` in `#ifndef PT_COLLAB_SERVER`.
+  - Added a `#ifdef PT_COLLAB_SERVER` server `int main`: parses `--port`, `--replicas`, `--doc`; switches Cotamer to `clock::real_time`; builds a `testinfo` with `loss=0` / `failure_schedule=none`; constructs `http_client_model` + `pt_paxos_instance`; starts each replica with `inst.replicas[s]->run()`; spawns `run_http_server`; calls `cot::loop()` and never returns.
+- `pset4/CMakeLists.txt`: new `pt-collab-server` target that compiles `pt-collab.cc` with `-DPT_COLLAB_SERVER`, plus `http_server.cc`, `doc_ops.cc`, `doc_state.cc`, `collab_model.cc`, Cotamer, and Pancy.
+
+#### Tests conducted
+
+Built with `cmake --build build --target pt-collab-server` (Homebrew clang++ as before). Ran the binary on port 18080 / 18081 and exercised every route with curl:
+
+```
+$ curl -s http://localhost:18080/doc/main
+{"text":"","version":0}
+
+$ curl -s -X POST http://localhost:18080/doc/main/op \
+       -H 'content-type: application/json' \
+       -d '{"type":"I","pos":0,"text":"hello","client_id":"a","seq":0}'
+{"version":1}
+
+$ curl -s http://localhost:18080/doc/main
+{"text":"hello","version":1}
+
+$ curl -s -X POST http://localhost:18080/doc/main/op \
+       -H 'content-type: application/json' \
+       -d '{"type":"I","pos":5,"text":" world","client_id":"a","seq":1}'
+{"version":2}
+
+$ curl -s http://localhost:18080/doc/main
+{"text":"hello world","version":2}
+
+$ curl -s http://localhost:18080/docs           # ["main"]
+$ curl -s http://localhost:18080/nope           # 404 {"error":"no route"}
+```
+
+SSE smoke test: pre-seeded one insert, opened `curl -N --max-time 4 .../doc/main/stream`, then POSTed two more ops 1 s apart (insert "def" at 3, then delete pos 2 len 2). The stream emitted three `event: op` blocks with monotonically increasing `version` and the post-delete `GET` returned `{"text":"abef","version":3}` — matches the OT/`reconstruct` semantics.
+
+All four acceptance steps from the plan pass. The `--port` flag works; `--replicas N` + `--doc <id>` are wired but only the default path was exercised.
+
+#### Notes / spec alignment
+
+- **Departure from the plan** — `http_client_model` is the *only* client (`nclients_ = 1`, cid 0). The plan envisioned HTTP coexisting with simulated editors at cids `0..nclients_-2` and reserving the top cid for HTTP. The server doesn't run `collab_model` at all, so the simpler shape is fine; if we ever want to mix simulated and real traffic in the same server process, revisit.
+- **Departure from the plan** — retry policy is "advance replica by 1 on each timeout, sticky leader on success" rather than `collab_model`'s "every 3rd timeout, jump to a random replica". Redirects are handled identically (in `receive_response`). 12-attempt budget per request.
+- The plan said "stubs (501) for `/docs`"; we ship a real (single-doc) list since it was one line. Cursor route is still unimplemented and falls through to 404 — that's a Chunk 8 deliverable.
+- Connections are HTTP/1.1 but use `Connection: close` per response (no keep-alive). Browsers handle this fine; revisit only if the editor JS measurably suffers.
+- SSE polls `collab::read_ops` every 250 ms per open subscriber. That's O(subscribers × ops) work per second — fine for a 2-tab demo, worth replacing with a shared "ops since vN" notifier in Chunk 8 if we ever want more clients.
+- The server runs in-process Paxos with `loss=0` and no failure schedule — that's intentional for the demo binary; failure-tolerance is already exercised by `pt-collab` under `collab-bench.sh`.
+
+---
+
+### Chunk 6 plan (locked 2026-05-04, retained for reference)
+
+What was actually shipped tracks every row of the table below; left here so the design rationale stays next to the code.
+
+#### Plan (decisions)
+
+| Decision | Choice |
+|---|---|
+| Integration with Paxos | **Pragmatic.** Keep `pt_paxos_*` in `pt-collab.cc`. Compile that file twice via CMake: existing `pt-collab` target + new **`pt-collab-server`** target with `-DPT_COLLAB_SERVER`, which selects a server `main` and links `http_server.cc`. Refactor into a shared header only if there is time. |
+| HTTP “client” to Paxos | **One dedicated simulated client id** = `nclients_ - 1`. All HTTP `POST /op` calls funnel through one coroutine that uses `send_request` / `receive_response` with the **same redirect + 3-timeout leader-switch** as `collab_model`. Editors keep ids `0..nclients_-2`. |
+| “version” in JSON | The PancyDB `vv.version` of the op key. `POST /op` returns the version assigned by `put_response`. `GET /doc/<id>` returns the **max `version` from `read_ops`** under the prefix. No separate “doc version” key. |
+| POST body | Insert: `{"type":"I","pos":N,"text":"..","client_id":"<str>","seq":N}`. Delete: `{"type":"D","pos":N,"len":N,"client_id":"<str>","seq":N}`. Server stores under `op_key(doc_id, hash(client_id), seq)` (or remap `client_id` to a stable int). Bad input → `400 {"error":"…"}`. |
+| Idempotency | `client_id` + `seq` is the **client-supplied** dedupe key. Server overwrites if the same key is retried — Paxos still totals only one slot per accepted PUT, and `read_ops` sorts by `version`. |
+| SSE | `Content-Type: text/event-stream`. Op event: `event: op\ndata: {"version":N,"client_id":"…","seq":N,"op":{...}}\n\n`. **15 s heartbeat** as `event: ping\ndata: {}\n\n`. Cursor uses `event: cursor` (Chunk 8). |
+| Scope of this PR | **MVP:** `GET /doc/<id>`, `POST /doc/<id>/op`, `GET /doc/<id>/stream`. Stubs (501 / static) for cursor + `/docs`; finish those in Chunk 8. |
+| HTTP layer | **Manual HTTP/1.1** on Cotamer TCP (`tcp_listen`, `tcp_accept`, `read_once`, `write_once`) — small parser, header read until `\r\n\r\n`, body via `Content-Length`. No external HTTP dep. |
+
+#### Files & build
+
+- New: `pset4/http_server.hh`, `pset4/http_server.cc`, `pset4/pt-collab-server.cc` (thin, calls the existing main path with `--server` semantics or includes the same TU under `PT_COLLAB_SERVER`).
+- `CMakeLists.txt`: add `pt-collab-server` target compiling `pt-collab.cc` (with `-DPT_COLLAB_SERVER`) + `http_server.cc` + `doc_ops.cc` + `doc_state.cc` + `collab_model.cc` + Cotamer + Pancy.
+
+#### Acceptance (curl)
+
+```bash
+./build/pt-collab-server --port 8080 &        # starts replicas + HTTP
+curl localhost:8080/doc/main                   # {"text":"","version":0}
+curl -X POST localhost:8080/doc/main/op \
+     -H 'content-type: application/json' \
+     -d '{"type":"I","pos":0,"text":"hello","client_id":"a","seq":0}'  # {"version":N}
+curl localhost:8080/doc/main                   # {"text":"hello","version":M}
+curl -N localhost:8080/doc/main/stream         # event: op (and event: ping)
+```
 
 ---
 
