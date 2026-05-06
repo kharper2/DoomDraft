@@ -416,6 +416,76 @@ The JS `transform()` is a direct port of the C++ function — same 4 cases. Cros
 
 ---
 
+### Chunk 7 implementation log (Aengus, 2026-05-05)
+
+**Status: COMPLETE.**
+
+#### What was implemented
+
+**`pset4/static/editor.html`** — dark-themed, monospace, no dependencies:
+- Toolbar: server URL input (default `http://localhost:8080`), doc ID input (default `main`), Connect button, status badge, version counter.
+- Full-viewport `<textarea id="editor">` with caret-color `#89b4fa`.
+- `<div id="cursor-overlay">` for peer cursor markers (wired up, populated by Chunk 8's SSE cursor events).
+- Script tag for `editor.js`.
+
+**`pset4/static/editor.js`** — all OT client logic:
+
+*`transform(a, b)`*: exact port of `doc_ops.cc`. Four cases, DD has all six sub-cases (A–F). Tie-break for equal-position I/I: `b.pos <= a.pos` → shift `a` right (matches C++).
+
+*`applyOp(text, op)`*: string slice implementation of `apply_op`; clamps `pos` and `len` identically to C++.
+
+*`computeDelta(oldText, newText)`*: longest-common-prefix + suffix compression; returns at most two ops (delete then insert), one of which may be absent.
+
+*`adjustCursor(cursor, op)`*: shifts the textarea caret to account for a committed foreign op (insert before cursor → shift right; delete covering cursor → clamp to delete start; delete before cursor → shift left).
+
+*Submit pipeline*: only one op is in-flight at a time (`inflightSeq`). User edits accumulate in `s.pending`; `sendPendingFront()` drains them one-at-a-time via `fetch POST /doc/<id>/op`. Next op is sent only when the current one is confirmed via SSE — eliminates out-of-order detection complexity.
+
+*`handleSSEOp(data)`*: if `mySeqs.has(data.seq) && pending[0].seq === data.seq` → our op confirmed: pop from pending, apply to `serverText`, trigger next submission. Otherwise foreign: transform all pending ops against it, apply to `serverText`, call `syncTextarea(op)` with cursor adjustment.
+
+*`connect()`*: reads server/doc from toolbar inputs or `?server=&doc=` URL query params, fetches initial doc state, opens `EventSource`.
+
+*`runTests()`*: browser-console test runner verifying all 18 transform test vectors from Chunk 1 (II, ID, DI, DD/A–F) plus `applyOp` corner cases.
+
+**`pset4/http_server.cc`** — small additions to enable browser access:
+- `serve_static_file()` helper: reads file from disk relative to CWD, sends with correct `Content-Type`.
+- `GET /` and `GET /editor.html` → `static/editor.html`.
+- `GET /editor.js` → `static/editor.js`.
+- `OPTIONS *` → CORS preflight response (needed if editor is served from a different origin).
+
+#### Usage
+
+Run server from `pset4/` directory (so `static/` relative path resolves):
+```bash
+./build/pt-collab-server --port 8080
+```
+Then open `http://localhost:8080/` in two browser tabs. Both load the same document; typing in one tab appears in the other within ≤250 ms (one SSE poll cycle).
+
+To run JS transform tests: open browser console and call `runTests()`. All 18 + 3 checks pass.
+
+#### Design decisions
+
+*One-at-a-time submission*: avoids the need to distinguish our own ops from foreign ops purely by seq number (which has precision issues for large uint64 hashes through JSON). With a single in-flight op, `pending[0]` is always the candidate; `mySeqs.has(seq)` is a reliable gate.
+
+*Cursor adjustment via `adjustCursor`*: simple positional arithmetic (not a phantom-insert transform call), avoids the edge case where the Insert/Insert tie-break rule would move the cursor to the wrong side of concurrent inserts.
+
+*Chunk 8 hooks*: `handleSSECursor`, `renderCursorOverlay`, and `peerCursors` map are already wired; they are no-ops until the server sends `event: cursor` events.
+
+#### Tests conducted
+
+| Test | Result |
+|---|---|
+| `cmake --build build --target pt-collab-server` | PASS (clean, 2 pre-existing warnings in pt-collab.cc) |
+| `curl http://localhost:18090/` | 200, serves editor.html |
+| `curl http://localhost:18090/editor.html` | 200, correct HTML |
+| `curl http://localhost:18090/editor.js` | 200, correct JS |
+| `curl http://localhost:18090/doc/main` | `{"text":"","version":0}` |
+| POST insert + GET | `{"text":"hello","version":1}` |
+| `runTests()` in browser console | 21/21 pass |
+
+Two-tab live demo: opened `http://localhost:8080/` in two Chrome tabs, typed in tab A, edits appeared in tab B within one SSE poll cycle (≤250 ms). Concurrent typing from both tabs converged correctly.
+
+---
+
 ## Chunk 8 — Person B (2 hrs): Cursor tracking, multi-doc, server binary
 
 **Files:** `pt-collab-server.cc`, update `http_server.cc`

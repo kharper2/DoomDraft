@@ -7,9 +7,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <print>
 #include <string>
 #include <string_view>
@@ -283,6 +286,24 @@ std::string http_response(int status, std::string_view reason,
 }
 
 // ---------------------------------------------------------------------------
+// Static file helper
+// ---------------------------------------------------------------------------
+
+// Read a file from disk and send it as an HTTP response.
+// path is relative to the process working directory (run server from pset4/).
+cot::task<> serve_static_file(const cot::fd& f, const char* path,
+                               std::string_view ct) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        co_await write_all(f, http_response(404, "Not Found", "text/plain",
+                                            "File not found\n"));
+        co_return;
+    }
+    std::string body(std::istreambuf_iterator<char>(file), {});
+    co_await write_all(f, http_response(200, "OK", ct, body));
+}
+
+// ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
 
@@ -363,18 +384,24 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
 // GET /doc/<id>/stream  ->  text/event-stream forever
 //
 // Polls the leader's pancydb every 250 ms; emits any committed ops with
-// version > last_seen as `event: op\ndata: {...}\n\n`. Heartbeats every 15 s.
-cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge) {
+// version > last_seen as `id: N\nevent: op\ndata: {...}\n\n`. Heartbeats
+// every 5 s (keep browsers and proxies from treating the idle connection
+// as dead). The `retry: 1000` directive tells the browser to reconnect
+// after 1 s on error. `id:` fields let the browser send Last-Event-ID
+// when reconnecting so we can resume from the right version.
+cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge,
+                           pancy::version_type resume_from) {
     std::string head = std::format(
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "Access-Control-Allow-Origin: *\r\n"
-        "\r\n");
+        "\r\n"
+        "retry: 1000\n\n");   // tell browser: 1 s reconnect delay
     if (!co_await write_all(f, head)) co_return;
 
-    pancy::version_type last_seen = 0;
+    pancy::version_type last_seen = resume_from;
     auto last_heartbeat = cot::steady_now();
     while (true) {
         auto ops = collab::read_ops(bridge.current_db(), bridge.doc_id);
@@ -392,16 +419,18 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge) {
                 op_payload = std::format("\"pos\":{},\"len\":{}", dl.pos, dl.len);
             }
             std::string ev = std::format(
+                "id: {}\n"
                 "event: op\n"
                 "data: {{\"version\":{},\"client_id\":{},\"seq\":{},"
                 "\"op\":{{\"type\":\"{}\",{}}}}}\n\n",
+                c.version,
                 c.version, c.client_id, c.client_seq, op_kind, op_payload);
             if (!co_await write_all(f, ev)) co_return;
             last_seen = c.version;
         }
 
         auto now = cot::steady_now();
-        if (now - last_heartbeat >= 15s) {
+        if (now - last_heartbeat >= 5s) {   // 5 s — well inside browser idle limits
             if (!co_await write_all(f, std::string("event: ping\ndata: {}\n\n"))) {
                 co_return;
             }
@@ -438,11 +467,39 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
     } else if (rl.method == "POST" && rl.path == doc_prefix + "/op") {
         co_await handle_post_op(conn, bridge, std::move(body));
     } else if (rl.method == "GET" && rl.path == doc_prefix + "/stream") {
-        co_await handle_stream(conn, bridge);
+        // Resume from Last-Event-ID if the browser is reconnecting.
+        pancy::version_type resume_from = 0;
+        {
+            std::string lei = find_header(head_only, "last-event-id");
+            if (!lei.empty()) {
+                pancy::version_type v = 0;
+                auto [ptr, ec] = std::from_chars(lei.data(), lei.data() + lei.size(), v);
+                if (ec == std::errc()) resume_from = v;
+            }
+        }
+        co_await handle_stream(conn, bridge, resume_from);
     } else if (rl.method == "GET" && rl.path == "/docs") {
         std::string body_out = std::format("[\"{}\"]", json_escape(bridge.doc_id));
         co_await write_all(conn, http_response(200, "OK",
                                                "application/json", body_out));
+    } else if (rl.method == "GET" &&
+               (rl.path == "/" || rl.path == "/editor.html")) {
+        co_await serve_static_file(conn, "static/editor.html",
+                                   "text/html; charset=utf-8");
+    } else if (rl.method == "GET" && rl.path == "/editor.js") {
+        co_await serve_static_file(conn, "static/editor.js",
+                                   "application/javascript; charset=utf-8");
+    } else if (rl.method == "OPTIONS") {
+        // CORS preflight — browsers send this before cross-origin POSTs.
+        co_await write_all(conn, std::string(
+            "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Access-Control-Max-Age: 86400\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n"));
     } else {
         co_await write_all(conn, http_response(404, "Not Found",
                                                "application/json",
