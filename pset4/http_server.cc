@@ -8,12 +8,15 @@
 #include <cassert>
 #include <cctype>
 #include <charconv>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <print>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -69,13 +72,67 @@ cot::task<pancy::version_type> http_client_model::submit_put(std::string key,
 
 namespace {
 
-struct doc_cache_state {
+constexpr std::string_view kDocsRegistryKey = "docs/registry";
+std::string json_escape(std::string_view s);
+std::optional<std::string> json_get_string(std::string_view body, std::string_view key);
+std::optional<int64_t> json_get_int(std::string_view body, std::string_view key);
+
+std::string docs_registry_json(const std::set<std::string>& docs) {
+    std::string out = "[";
+    bool first = true;
+    for (const auto& d : docs) {
+        if (!first) out += ",";
+        first = false;
+        out += std::format("\"{}\"", json_escape(d));
+    }
+    out += "]";
+    return out;
+}
+
+bool valid_doc_id(std::string_view doc_id) {
+    if (doc_id.empty()) return false;
+    for (char c : doc_id) {
+        const bool ok = std::isalnum(static_cast<unsigned char>(c))
+                        || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+std::set<std::string> parse_docs_registry(std::string_view body) {
+    std::set<std::string> out;
+    size_t i = 0;
+    while (i < body.size()) {
+        if (body[i] == '"') {
+            size_t j = i + 1;
+            while (j < body.size() && body[j] != '"') ++j;
+            if (j < body.size() && j > i + 1) {
+                std::string d(body.substr(i + 1, j - i - 1));
+                if (valid_doc_id(d)) out.insert(std::move(d));
+            }
+            i = j + 1;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+struct cursor_entry {
+    pancy::version_type version = 0;
+    std::string client_id;
+    int64_t pos = 0;
+};
+
+struct per_doc_cache {
     std::vector<collab::committed_op> ops_;
+    std::map<uint64_t, cursor_entry> cursors_;
     std::string text_;
     pancy::version_type version_ = 0;
     uint64_t epoch_ = 0;
+    uint64_t cursor_epoch_ = 0;
 
-    void refresh_from_db(const pancy::pancydb& db, std::string_view doc_id) {
+    void refresh_ops_from_db(const pancy::pancydb& db, std::string_view doc_id) {
         std::vector<collab::committed_op> fresh = collab::read_ops(db, doc_id);
         const pancy::version_type fresh_version = fresh.empty() ? 0 : fresh.back().version;
         if (fresh.empty()) {
@@ -119,6 +176,49 @@ struct doc_cache_state {
         ++epoch_;
     }
 
+    void refresh_cursors_from_db(const pancy::pancydb& db, std::string_view doc_id) {
+        std::string prefix = std::format("doc/{}/cursor/", doc_id);
+        std::map<uint64_t, cursor_entry> fresh;
+        for (auto it = db.begin(); it != db.end(); ++it) {
+            const auto& key = it->first;
+            if (key.size() <= prefix.size() || key.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            std::string_view suffix(key);
+            suffix.remove_prefix(prefix.size());
+            uint64_t cid_hash = 0;
+            auto [ptr, ec] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), cid_hash);
+            if (ec != std::errc() || ptr != suffix.data() + suffix.size()) {
+                continue;
+            }
+            const auto& cell = it->second;
+            auto client_id = json_get_string(cell.value, "client_id");
+            auto pos = json_get_int(cell.value, "pos");
+            if (!client_id || !pos) continue;
+            fresh[cid_hash] = cursor_entry{cell.version, std::move(*client_id), *pos};
+        }
+        bool changed = fresh.size() != cursors_.size();
+        if (!changed) {
+            auto it_a = fresh.begin();
+            auto it_b = cursors_.begin();
+            while (it_a != fresh.end()) {
+                if (it_a->first != it_b->first
+                    || it_a->second.version != it_b->second.version
+                    || it_a->second.client_id != it_b->second.client_id
+                    || it_a->second.pos != it_b->second.pos) {
+                    changed = true;
+                    break;
+                }
+                ++it_a;
+                ++it_b;
+            }
+        }
+        if (changed) {
+            cursors_ = std::move(fresh);
+            ++cursor_epoch_;
+        }
+    }
+
     void note_committed(const collab::committed_op& c) {
         // Expected hot path: monotonically increasing commit versions.
         if (c.version > version_) {
@@ -130,7 +230,24 @@ struct doc_cache_state {
     }
 };
 
-doc_cache_state g_doc_cache;
+struct server_cache_state {
+    std::set<std::string> known_docs_;
+    std::map<std::string, per_doc_cache> by_doc_;
+    uint64_t docs_epoch_ = 0;
+
+    per_doc_cache& doc(std::string_view doc_id) {
+        return by_doc_[std::string(doc_id)];
+    }
+
+    void ensure_doc(std::string_view doc_id) {
+        if (known_docs_.insert(std::string(doc_id)).second) {
+            ++docs_epoch_;
+        }
+        by_doc_.try_emplace(std::string(doc_id));
+    }
+};
+
+server_cache_state g_state;
 
 // Lowercase, ASCII-only.
 std::string ascii_lower(std::string s) {
@@ -370,17 +487,17 @@ cot::task<> serve_static_file(const cot::fd& f, const char* path,
 // Route handlers
 // ---------------------------------------------------------------------------
 
-// GET /doc/<id> -> {"text":"...","version":N}
-cot::task<> handle_get_doc(const cot::fd& f, const http_paxos_bridge&) {
+cot::task<> handle_get_doc_id(const cot::fd& f, std::string_view doc_id) {
+    auto& cache = g_state.doc(doc_id);
     std::string body = std::format("{{\"text\":\"{}\",\"version\":{}}}",
-                                    json_escape(g_doc_cache.text_), g_doc_cache.version_);
+                                    json_escape(cache.text_), cache.version_);
     co_await write_all(f, http_response(200, "OK", "application/json", body));
 }
 
 // POST /doc/<id>/op  body: {"type":"I","pos":N,"text":"..","client_id":"..","seq":N}
 //                          {"type":"D","pos":N,"len":N,"client_id":"..","seq":N}
-cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
-                           std::string body) {
+cot::task<> handle_post_op_doc(const cot::fd& f, const http_paxos_bridge& bridge,
+                               std::string_view doc_id, std::string body) {
     auto started = cot::steady_now();
     auto type_opt = json_get_string(body, "type");
     auto pos_opt = json_get_int(body, "pos");
@@ -427,7 +544,7 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
     }
 
     uint64_t hashed_cid = hash_client_id(*cid_opt);
-    std::string key = collab::op_key(bridge.doc_id, hashed_cid,
+    std::string key = collab::op_key(doc_id, hashed_cid,
                                      static_cast<uint64_t>(*seq_opt));
     std::string value = collab::serialize(op);
 
@@ -438,7 +555,8 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
             "{\"error\":\"paxos commit timed out\"}"));
         co_return;
     }
-    g_doc_cache.note_committed(collab::committed_op{
+    auto& cache = g_state.doc(doc_id);
+    cache.note_committed(collab::committed_op{
         version, hashed_cid, static_cast<uint64_t>(*seq_opt), op
     });
     std::string resp_body = std::format("{{\"version\":{}}}", version);
@@ -446,7 +564,7 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         cot::steady_now() - started);
     std::print("POST /doc/{}/op commit version={} latency_ms={}\n",
-               bridge.doc_id, version, elapsed_ms.count());
+               doc_id, version, elapsed_ms.count());
 }
 
 // GET /doc/<id>/stream  ->  text/event-stream forever
@@ -457,8 +575,8 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
 // as dead). The `retry: 1000` directive tells the browser to reconnect
 // after 1 s on error. `id:` fields let the browser send Last-Event-ID
 // when reconnecting so we can resume from the right version.
-cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge&,
-                           pancy::version_type resume_from) {
+cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
+                              pancy::version_type resume_from) {
     std::string head = std::format(
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -470,9 +588,11 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge&,
     if (!co_await write_all(f, head)) co_return;
 
     pancy::version_type last_seen = resume_from;
+    uint64_t last_cursor_epoch = 0;
     auto last_heartbeat = cot::steady_now();
     while (true) {
-        for (const auto& c : g_doc_cache.ops_) {
+        auto& cache = g_state.doc(doc_id);
+        for (const auto& c : cache.ops_) {
             if (c.version <= last_seen) continue;
             std::string op_kind;
             std::string op_payload;
@@ -495,6 +615,16 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge&,
             if (!co_await write_all(f, ev)) co_return;
             last_seen = c.version;
         }
+        if (cache.cursor_epoch_ != last_cursor_epoch) {
+            for (const auto& [cid_hash, cur] : cache.cursors_) {
+                std::string cev = std::format(
+                    "event: cursor\n"
+                    "data: {{\"client_id\":\"{}\",\"pos\":{},\"version\":{}}}\n\n",
+                    json_escape(cur.client_id), cur.pos, cur.version);
+                if (!co_await write_all(f, cev)) co_return;
+            }
+            last_cursor_epoch = cache.cursor_epoch_;
+        }
 
         auto now = cot::steady_now();
         if (now - last_heartbeat >= 5s) {   // 5 s — well inside browser idle limits
@@ -507,11 +637,69 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge&,
     }
 }
 
+cot::task<> handle_post_cursor_doc(const cot::fd& f, const http_paxos_bridge& bridge,
+                                   std::string_view doc_id, std::string body) {
+    auto cid = json_get_string(body, "client_id");
+    auto pos = json_get_int(body, "pos");
+    if (!cid || !pos) {
+        co_await write_all(f, http_response(
+            400, "Bad Request", "application/json",
+            "{\"error\":\"missing field (client_id/pos)\"}"));
+        co_return;
+    }
+    if (*pos < 0) {
+        co_await write_all(f, http_response(
+            400, "Bad Request", "application/json",
+            "{\"error\":\"pos must be >= 0\"}"));
+        co_return;
+    }
+    uint64_t cid_hash = hash_client_id(*cid);
+    std::string key = std::format("doc/{}/cursor/{}", doc_id, cid_hash);
+    std::string val = std::format("{{\"client_id\":\"{}\",\"pos\":{}}}",
+                                  json_escape(*cid), *pos);
+    pancy::version_type version = co_await bridge.client->submit_put(key, val);
+    if (version == 0) {
+        co_await write_all(f, http_response(
+            504, "Gateway Timeout", "application/json",
+            "{\"error\":\"paxos commit timed out\"}"));
+        co_return;
+    }
+    g_state.doc(doc_id).cursors_[cid_hash] = cursor_entry{version, *cid, *pos};
+    g_state.doc(doc_id).cursor_epoch_++;
+    co_await write_all(f, http_response(
+        200, "OK", "application/json",
+        std::format("{{\"version\":{}}}", version)));
+}
+
 cot::task<> poll_doc_cache(http_paxos_bridge bridge) {
     while (true) {
-        g_doc_cache.refresh_from_db(bridge.current_db(), bridge.doc_id);
+        const auto& db = bridge.current_db();
+        if (auto vv = db.get(std::string(kDocsRegistryKey)); vv) {
+            auto parsed = parse_docs_registry(vv->value);
+            for (const auto& d : parsed) g_state.ensure_doc(d);
+        }
+        for (const auto& d : g_state.known_docs_) {
+            auto& cache = g_state.doc(d);
+            cache.refresh_ops_from_db(db, d);
+            cache.refresh_cursors_from_db(db, d);
+        }
         co_await cot::after(100ms);
     }
+}
+
+std::optional<std::pair<std::string, std::string>> parse_doc_route(std::string_view path) {
+    if (!path.starts_with("/doc/")) return std::nullopt;
+    std::string_view rest = path.substr(std::string_view("/doc/").size());
+    size_t slash = rest.find('/');
+    if (slash == std::string_view::npos) {
+        std::string doc(rest);
+        if (!valid_doc_id(doc)) return std::nullopt;
+        return {{doc, ""}};
+    }
+    std::string doc(rest.substr(0, slash));
+    std::string sub(rest.substr(slash + 1));
+    if (!valid_doc_id(doc)) return std::nullopt;
+    return {{doc, sub}};
 }
 
 // One TCP connection -> dispatch one request, then close.
@@ -535,12 +723,17 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
         if (!co_await read_body(conn, body, want)) co_return;
     }
 
-    const std::string doc_prefix = "/doc/" + bridge.doc_id;
-    if (rl.method == "GET" && rl.path == doc_prefix) {
-        co_await handle_get_doc(conn, bridge);
-    } else if (rl.method == "POST" && rl.path == doc_prefix + "/op") {
-        co_await handle_post_op(conn, bridge, std::move(body));
-    } else if (rl.method == "GET" && rl.path == doc_prefix + "/stream") {
+    auto doc_route = parse_doc_route(rl.path);
+    if (doc_route && rl.method == "GET" && doc_route->second.empty()) {
+        g_state.ensure_doc(doc_route->first);
+        co_await handle_get_doc_id(conn, doc_route->first);
+    } else if (doc_route && rl.method == "POST" && doc_route->second == "op") {
+        g_state.ensure_doc(doc_route->first);
+        co_await handle_post_op_doc(conn, bridge, doc_route->first, std::move(body));
+    } else if (doc_route && rl.method == "POST" && doc_route->second == "cursor") {
+        g_state.ensure_doc(doc_route->first);
+        co_await handle_post_cursor_doc(conn, bridge, doc_route->first, std::move(body));
+    } else if (doc_route && rl.method == "GET" && doc_route->second == "stream") {
         // Resume from Last-Event-ID if the browser is reconnecting.
         pancy::version_type resume_from = 0;
         {
@@ -551,11 +744,32 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
                 if (ec == std::errc()) resume_from = v;
             }
         }
-        co_await handle_stream(conn, bridge, resume_from);
+        g_state.ensure_doc(doc_route->first);
+        co_await handle_stream_doc(conn, doc_route->first, resume_from);
     } else if (rl.method == "GET" && rl.path == "/docs") {
-        std::string body_out = std::format("[\"{}\"]", json_escape(bridge.doc_id));
+        std::string body_out = docs_registry_json(g_state.known_docs_);
         co_await write_all(conn, http_response(200, "OK",
                                                "application/json", body_out));
+    } else if (rl.method == "POST" && rl.path == "/docs") {
+        auto doc = json_get_string(body, "id");
+        if (!doc || !valid_doc_id(*doc)) {
+            co_await write_all(conn, http_response(
+                400, "Bad Request", "application/json",
+                "{\"error\":\"body must be {\\\"id\\\":\\\"doc-name\\\"}\"}"));
+            co_return;
+        }
+        g_state.ensure_doc(*doc);
+        std::string reg = docs_registry_json(g_state.known_docs_);
+        pancy::version_type v = co_await bridge.client->submit_put(std::string(kDocsRegistryKey), reg);
+        if (v == 0) {
+            co_await write_all(conn, http_response(
+                504, "Gateway Timeout", "application/json",
+                "{\"error\":\"paxos commit timed out\"}"));
+            co_return;
+        }
+        co_await write_all(conn, http_response(
+            200, "OK", "application/json",
+            std::format("{{\"ok\":true,\"version\":{},\"id\":\"{}\"}}", v, json_escape(*doc))));
     } else if (rl.method == "GET" &&
                (rl.path == "/" || rl.path == "/editor.html")) {
         co_await serve_static_file(conn, "static/editor.html",
@@ -623,7 +837,15 @@ cot::task<> run_http_server(uint16_t port, http_paxos_bridge bridge) {
         std::print(std::cerr, "HTTP listen on port {} failed: {}\n", port, e.what());
         co_return;
     }
-    g_doc_cache.refresh_from_db(bridge.current_db(), bridge.doc_id);
+    g_state.ensure_doc(bridge.doc_id);
+    {
+        const auto& db = bridge.current_db();
+        if (auto vv = db.get(std::string(kDocsRegistryKey)); vv) {
+            for (const auto& d : parse_docs_registry(vv->value)) {
+                g_state.ensure_doc(d);
+            }
+        }
+    }
     poll_doc_cache(bridge).detach();
     while (true) {
         cot::fd conn;

@@ -528,6 +528,62 @@ Add cursor broadcast to the SSE stream (poll `doc/<id>/cursor/*` keys in `watch_
 
 ---
 
+### Chunk 8 implementation log (Kathryn, 2026-05-07)
+
+**Status: COMPLETE.**
+
+#### What was implemented
+
+- `pset4/http_server.cc` upgraded from single-doc to **multi-doc** routing:
+  - Dynamic doc path parsing for:
+    - `GET /doc/<id>`
+    - `POST /doc/<id>/op`
+    - `GET /doc/<id>/stream`
+    - `POST /doc/<id>/cursor`
+  - Validation on doc IDs (`[A-Za-z0-9_.-]+`).
+- Added **document registry** endpoints:
+  - `GET /docs` returns JSON array of known docs.
+  - `POST /docs` with `{"id":"<doc>"}` creates/registers a doc and persists the registry under `docs/registry` through Paxos.
+- Added **cursor tracking and SSE cursor broadcast**:
+  - Cursor positions are committed under `doc/<id>/cursor/<hash(client_id)>`.
+  - SSE stream now emits:
+    - `event: op` for committed edit ops
+    - `event: cursor` for cursor updates with `{client_id,pos,version}`.
+- Extended in-memory cache model:
+  - Per-doc op cache + reconstructed text/version.
+  - Per-doc cursor cache and cursor epoch, refreshed from DB in the shared poller.
+- Preserved prior tuning:
+  - Shared background poller, low-latency op visibility, and `/admin/fail/<rid>` demo route.
+
+#### Tests conducted
+
+From repo root (`DoomDraft/`), running `./pset4/build/pt-collab-server --port 18120`:
+
+| Test | Result |
+|---|---|
+| `GET /docs` | `["main"]` |
+| `POST /docs {"id":"alpha"}` | `{"ok":true,"version":1,"id":"alpha"}` |
+| `GET /docs` after create | `["alpha","main"]` |
+| `POST /doc/alpha/op` insert `"A"` | `{"version":2}` |
+| `GET /doc/alpha` | `{"text":"A","version":2}` |
+| `GET /doc/main` unchanged | `{"text":"","version":0}` |
+| `POST /doc/alpha/cursor {"client_id":"u1","pos":1}` | `{"version":3}` |
+| `POST /doc/alpha/op` insert `"B"` | `{"version":4}` |
+| `GET /doc/alpha` final | `{"text":"AB","version":4}` |
+| `GET /doc/alpha/stream` (3s window) | Includes `event: op` (v2, v4) and `event: cursor` (v3) |
+
+Observed SSE sample:
+- `event: op` with `id: 2` for insert `"A"`
+- `event: op` with `id: 4` for insert `"B"`
+- `event: cursor` with `{"client_id":"u1","pos":1,"version":3}`
+
+#### Notes
+
+- This completes server-side Chunk 8 requirements (cursor events + multi-doc registry/routes).
+- Browser cursor rendering hooks from Chunk 7 can now consume live `event: cursor` data without further server changes.
+
+---
+
 ## Chunk 9 — Person A (2 hrs): Writeup
 
 Consensus/OT background, OT implementation, simulation testing results, failure analysis.
