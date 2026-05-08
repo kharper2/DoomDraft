@@ -486,6 +486,38 @@ Two-tab live demo: opened `http://localhost:8080/` in two Chrome tabs, typed in 
 
 ---
 
+### Post-Chunk-7 backend tuning pass (Kathryn, 2026-05-07)
+
+**Status: COMPLETE.** This is a stabilization/performance patch to support Chunk 7 usability; it is **not** Chunk 8.
+
+#### What changed
+
+- `pset4/http_server.cc`
+  - Added a shared doc cache (`ops_`, `text_`, `version_`) with one background poller (`poll_doc_cache`, 100 ms) so the server does one DB refresh loop globally instead of one `read_ops()` scan per SSE subscriber.
+  - `GET /doc/<id>` now serves cached text/version.
+  - `GET /doc/<id>/stream` now emits from cached ops instead of re-reading DB in each stream loop.
+  - `POST /doc/<id>/op` now:
+    - updates cache immediately after commit (faster visibility in browser tabs),
+    - logs commit latency to stdout (`latency_ms`) for profiling.
+  - Added `POST /admin/fail/<replica_id>` to trigger a replica failure during live demos.
+- `pset4/http_server.hh`
+  - Added `fail_replica` callback to `http_paxos_bridge`.
+- `pset4/pt-collab.cc`
+  - Wired `fail_replica` to `pt_paxos_instance::fail_replica(...)` with range checks.
+
+#### Verification
+
+| Test | Result |
+|---|---|
+| `cmake --build build --target pt-collab-server` | PASS |
+| `GET /doc/main` | PASS |
+| `POST /doc/main/op` | PASS (`{"version":N}`) |
+| `POST /admin/fail/1` then `POST /doc/main/op` | PASS (writes continue) |
+| `GET /doc/main` after failure | PASS (text/version converged) |
+| SSE stream during failure (`GET /doc/main/stream`) | PASS (continues emitting `event: op`) |
+
+---
+
 ## Chunk 8 — Person B (2 hrs): Cursor tracking, multi-doc, server binary
 
 **Files:** `pt-collab-server.cc`, update `http_server.cc`

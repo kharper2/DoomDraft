@@ -55,6 +55,7 @@ struct http_paxos_bridge {
     std::string doc_id;
     http_client_model* client = nullptr;
     std::function<const pancy::pancydb&()> current_db;
+    std::function<bool(size_t)> fail_replica;
 };
 
 // Listen on `port` and serve HTTP. Returns a task that runs forever; detach

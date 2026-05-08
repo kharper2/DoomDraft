@@ -69,6 +69,69 @@ cot::task<pancy::version_type> http_client_model::submit_put(std::string key,
 
 namespace {
 
+struct doc_cache_state {
+    std::vector<collab::committed_op> ops_;
+    std::string text_;
+    pancy::version_type version_ = 0;
+    uint64_t epoch_ = 0;
+
+    void refresh_from_db(const pancy::pancydb& db, std::string_view doc_id) {
+        std::vector<collab::committed_op> fresh = collab::read_ops(db, doc_id);
+        const pancy::version_type fresh_version = fresh.empty() ? 0 : fresh.back().version;
+        if (fresh.empty()) {
+            if (!ops_.empty()) {
+                ops_.clear();
+                text_.clear();
+                version_ = 0;
+                ++epoch_;
+            }
+            return;
+        }
+
+        // Fast path: prefix unchanged, only new suffix ops were committed.
+        bool append_only = fresh.size() >= ops_.size();
+        if (append_only) {
+            for (size_t i = 0; i != ops_.size(); ++i) {
+                if (fresh[i].version != ops_[i].version
+                    || fresh[i].client_id != ops_[i].client_id
+                    || fresh[i].client_seq != ops_[i].client_seq) {
+                    append_only = false;
+                    break;
+                }
+            }
+        }
+        if (append_only) {
+            for (size_t i = ops_.size(); i != fresh.size(); ++i) {
+                collab::apply_op(text_, fresh[i].op);
+                ops_.push_back(fresh[i]);
+            }
+            if (fresh_version != version_) {
+                version_ = fresh_version;
+                ++epoch_;
+            }
+            return;
+        }
+
+        // Slow path: recompute full state when prefix changed unexpectedly.
+        ops_ = std::move(fresh);
+        text_ = collab::reconstruct(ops_);
+        version_ = fresh_version;
+        ++epoch_;
+    }
+
+    void note_committed(const collab::committed_op& c) {
+        // Expected hot path: monotonically increasing commit versions.
+        if (c.version > version_) {
+            collab::apply_op(text_, c.op);
+            ops_.push_back(c);
+            version_ = c.version;
+            ++epoch_;
+        }
+    }
+};
+
+doc_cache_state g_doc_cache;
+
 // Lowercase, ASCII-only.
 std::string ascii_lower(std::string s) {
     for (auto& c : s) {
@@ -308,12 +371,9 @@ cot::task<> serve_static_file(const cot::fd& f, const char* path,
 // ---------------------------------------------------------------------------
 
 // GET /doc/<id> -> {"text":"...","version":N}
-cot::task<> handle_get_doc(const cot::fd& f, const http_paxos_bridge& bridge) {
-    auto ops = collab::read_ops(bridge.current_db(), bridge.doc_id);
-    std::string text = collab::reconstruct(ops);
-    pancy::version_type version = ops.empty() ? 0 : ops.back().version;
+cot::task<> handle_get_doc(const cot::fd& f, const http_paxos_bridge&) {
     std::string body = std::format("{{\"text\":\"{}\",\"version\":{}}}",
-                                    json_escape(text), version);
+                                    json_escape(g_doc_cache.text_), g_doc_cache.version_);
     co_await write_all(f, http_response(200, "OK", "application/json", body));
 }
 
@@ -321,6 +381,7 @@ cot::task<> handle_get_doc(const cot::fd& f, const http_paxos_bridge& bridge) {
 //                          {"type":"D","pos":N,"len":N,"client_id":"..","seq":N}
 cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
                            std::string body) {
+    auto started = cot::steady_now();
     auto type_opt = json_get_string(body, "type");
     auto pos_opt = json_get_int(body, "pos");
     auto cid_opt = json_get_string(body, "client_id");
@@ -377,8 +438,15 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
             "{\"error\":\"paxos commit timed out\"}"));
         co_return;
     }
+    g_doc_cache.note_committed(collab::committed_op{
+        version, hashed_cid, static_cast<uint64_t>(*seq_opt), op
+    });
     std::string resp_body = std::format("{{\"version\":{}}}", version);
     co_await write_all(f, http_response(200, "OK", "application/json", resp_body));
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        cot::steady_now() - started);
+    std::print("POST /doc/{}/op commit version={} latency_ms={}\n",
+               bridge.doc_id, version, elapsed_ms.count());
 }
 
 // GET /doc/<id>/stream  ->  text/event-stream forever
@@ -389,7 +457,7 @@ cot::task<> handle_post_op(const cot::fd& f, const http_paxos_bridge& bridge,
 // as dead). The `retry: 1000` directive tells the browser to reconnect
 // after 1 s on error. `id:` fields let the browser send Last-Event-ID
 // when reconnecting so we can resume from the right version.
-cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge,
+cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge&,
                            pancy::version_type resume_from) {
     std::string head = std::format(
         "HTTP/1.1 200 OK\r\n"
@@ -404,8 +472,7 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge,
     pancy::version_type last_seen = resume_from;
     auto last_heartbeat = cot::steady_now();
     while (true) {
-        auto ops = collab::read_ops(bridge.current_db(), bridge.doc_id);
-        for (const auto& c : ops) {
+        for (const auto& c : g_doc_cache.ops_) {
             if (c.version <= last_seen) continue;
             std::string op_kind;
             std::string op_payload;
@@ -437,6 +504,13 @@ cot::task<> handle_stream(const cot::fd& f, const http_paxos_bridge& bridge,
             last_heartbeat = now;
         }
         co_await cot::after(250ms);
+    }
+}
+
+cot::task<> poll_doc_cache(http_paxos_bridge bridge) {
+    while (true) {
+        g_doc_cache.refresh_from_db(bridge.current_db(), bridge.doc_id);
+        co_await cot::after(100ms);
     }
 }
 
@@ -500,6 +574,34 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
             "Content-Length: 0\r\n"
             "Connection: close\r\n"
             "\r\n"));
+    } else if (rl.method == "POST" && rl.path.rfind("/admin/fail/", 0) == 0) {
+        if (!bridge.fail_replica) {
+            co_await write_all(conn, http_response(
+                501, "Not Implemented", "application/json",
+                "{\"error\":\"fail endpoint not wired\"}"));
+            co_return;
+        }
+        size_t rid = 0;
+        std::string_view suffix(rl.path);
+        suffix.remove_prefix(std::string_view("/admin/fail/").size());
+        auto [ptr, ec] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), rid);
+        if (ec != std::errc() || ptr != suffix.data() + suffix.size()) {
+            co_await write_all(conn, http_response(
+                400, "Bad Request", "application/json",
+                "{\"error\":\"replica id must be numeric\"}"));
+            co_return;
+        }
+        bool ok = bridge.fail_replica(rid);
+        if (!ok) {
+            co_await write_all(conn, http_response(
+                400, "Bad Request", "application/json",
+                "{\"error\":\"invalid replica id\"}"));
+            co_return;
+        }
+        std::print("Admin fail: replica {}\n", rid);
+        co_await write_all(conn, http_response(
+            200, "OK", "application/json",
+            std::format("{{\"failed_replica\":{}}}", rid)));
     } else {
         co_await write_all(conn, http_response(404, "Not Found",
                                                "application/json",
@@ -521,6 +623,8 @@ cot::task<> run_http_server(uint16_t port, http_paxos_bridge bridge) {
         std::print(std::cerr, "HTTP listen on port {} failed: {}\n", port, e.what());
         co_return;
     }
+    g_doc_cache.refresh_from_db(bridge.current_db(), bridge.doc_id);
+    poll_doc_cache(bridge).detach();
     while (true) {
         cot::fd conn;
         try {

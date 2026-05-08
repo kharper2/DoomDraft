@@ -1110,6 +1110,13 @@ int main(int argc, char* argv[]) {
     if (leader >= inst.replicas.size()) leader = 0;
     return inst.replicas[leader]->db_;
   };
+  bridge.fail_replica = [&inst](size_t rid) -> bool {
+    if (rid >= inst.replicas.size()) {
+      return false;
+    }
+    inst.fail_replica(rid);
+    return true;
+  };
 
   cot::task<> http_task = run_http_server(port, std::move(bridge));
 
