@@ -584,15 +584,39 @@ Observed SSE sample:
 
 ---
 
+### Project wrap — browser + docs (Kathryn, 2026-05-11)
+
+**Status: COMPLETE for handoff.** Aengus does final checks before submit.
+
+- Added missing **`pset4/static/editor.html`** and **`pset4/static/editor.js`** (they were documented in Chunk 7 but not present in-tree): full OT client, `EventSource` for `op` + `cursor`, one-op-in-flight pipeline, `runTests()` for core transform vectors.
+- UI: server URL, doc id, **doc dropdown** (`GET /docs`), **New doc** (`POST /docs`), **Connect**, optional **Fail replica** demo button (`POST /admin/fail/<id>`), version badge, peer cursor overlay (`ch`-based horizontal position).
+- **Course paper (submission):** polished Markdown in repo-root **`WRITEUP.md`** (~4–6 pages when typeset to PDF). **`linear.md`** stays the internal chunk tracker + implementation logs only.
+
+---
+
 ## Chunk 9 — Person A (2 hrs): Writeup
 
 Consensus/OT background, OT implementation, simulation testing results, failure analysis.
+
+**Status: COMPLETE (draft).** Paper sections **§§1–5** (+ failure in §5) in **`WRITEUP.md`**. Kathryn drafted; Aengus may tighten before PDF export.
 
 ---
 
 ## Chunk 10 — Person B (2 hrs): Writeup
 
 System architecture, HTTP/deployment design, browser demo, discussion/future work. Both partners share intro and conclusion.
+
+**Status: COMPLETE (draft).** Paper sections **§§6–9** in **`WRITEUP.md`**.
+
+---
+
+## Appendix — Course paper (pointer only)
+
+**Do not duplicate the full paper here.** The short academic writeup lives in:
+
+- **`WRITEUP.md`** — export to **PDF** (or copy into Google Docs) for submission; includes abstract + §§1–9.
+
+All chunk specs, implementation logs, and checklists remain in **`linear.md`** above.
 
 ---
 
@@ -608,8 +632,8 @@ System architecture, HTTP/deployment design, browser demo, discussion/future wor
 | 6 | B | 4 | HTTP server, curl-verified |
 | 7 | A | 3 | Browser editor, two-tab demo |
 | 8 | B | 2 | Cursors, multi-doc, server binary |
-| 9 | A | 2 | Writeup (A sections) |
-| 10 | B | 2 | Writeup (B sections) |
+| 9 | A | 2 | Writeup (A sections) — **`WRITEUP.md`** §§1–5; Kathryn drafted; Aengus may tighten |
+| 10 | B | 2 | Writeup (B sections) — **`WRITEUP.md`** §§6–9 |
 
 **Person A: 15 hours. Person B: 14 hours.**
 
