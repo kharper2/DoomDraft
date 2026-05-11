@@ -6,66 +6,186 @@
   <title>DoomDraft</title>
   <style>
     :root {
-      --bg: #1e1e2e;
-      --fg: #cdd6f4;
-      --muted: #6c7086;
-      --accent: #89b4fa;
-      --surface: #313244;
-      --ok: #a6e3a1;
-      --warn: #f9e2af;
+      --page: #000000;
+      --bar: #1a1a1a;
+      --bar-border: #2d2d2d;
+      --surface: #0f0f0f;
+      --field: #1e1e1e;
+      --field-border: #3c4043;
+      --text: #f1f3f4;
+      --muted: #9aa0a6;
+      --accent: #8ab4f8;
+      --ok: #81c995;
+      --err: #f28b82;
+      --focus: #8ab4f8;
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: var(--page);
+      color: var(--text);
+      font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, system-ui, sans-serif;
+      font-size: 13px;
+    }
+    /* Top bar: server URL, document id, connect actions, optional demo controls, status */
     #toolbar {
-      display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
-      padding: 0.5rem 0.75rem; background: var(--surface); border-bottom: 1px solid #45475a;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 1rem;
+      row-gap: 0.5rem;
+      padding: 0.5rem 1rem;
+      min-height: 48px;
+      background: var(--bar);
+      border-bottom: 1px solid var(--bar-border);
     }
-    #toolbar label { font-size: 0.75rem; color: var(--muted); }
-    #toolbar input, #toolbar select, #toolbar button {
-      background: #181825; color: var(--fg); border: 1px solid #45475a; border-radius: 4px;
-      padding: 0.35rem 0.5rem; font: inherit;
+    .app-brand {
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--text);
+      padding-right: 0.75rem;
+      margin-right: 0.25rem;
+      border-right: 1px solid var(--bar-border);
     }
-    #toolbar button { cursor: pointer; }
-    #toolbar button:hover { border-color: var(--accent); }
-    #status { margin-left: auto; font-size: 0.8rem; color: var(--muted); }
+    .toolbar-tools {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 0.75rem;
+      flex: 1;
+    }
+    #toolbar label {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    #toolbar input,
+    #toolbar select,
+    #toolbar button {
+      background: var(--field);
+      color: var(--text);
+      border: 1px solid var(--field-border);
+      border-radius: 6px;
+      padding: 0.4rem 0.55rem;
+      font: inherit;
+    }
+    #toolbar input::placeholder { color: #70757a; }
+    #toolbar button {
+      cursor: pointer;
+      font-weight: 500;
+    }
+    #toolbar button:hover {
+      background: #2a2a2a;
+      border-color: #5f6368;
+    }
+    #toolbar button:focus-visible,
+    #toolbar input:focus-visible,
+    #toolbar select:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 1px;
+    }
+    #toolbar .demo {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding-left: 0.75rem;
+      margin-left: 0.25rem;
+      border-left: 1px solid var(--bar-border);
+    }
+    #toolbar .demo label { color: #fdd663; }
+    #status-wrap {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
     #status.ok { color: var(--ok); }
-    #status.err { color: #f38ba8; }
-    #wrap { position: relative; flex: 1; display: flex; min-height: 0; }
-    #main { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-    #editor {
-      flex: 1; width: 100%; resize: none; margin: 0; padding: 0.75rem;
-      background: #11111b; color: var(--fg); border: none; outline: none;
-      caret-color: var(--accent);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 14px; line-height: 1.4; tab-size: 4;
+    #status.err { color: var(--err); }
+    #ver { font-variant-numeric: tabular-nums; }
+    #main {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
     }
+    #wrap {
+      position: relative;
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+    #editor {
+      flex: 1;
+      width: 100%;
+      resize: none;
+      margin: 0;
+      padding: 1.25rem 1.5rem max(1.25rem, 4vh);
+      background: var(--page);
+      color: var(--text);
+      border: none;
+      outline: none;
+      caret-color: var(--accent);
+      font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.55;
+      tab-size: 4;
+    }
+    #editor::placeholder { color: #70757a; }
     #cursor-overlay {
-      pointer-events: none; position: absolute; left: 0.75rem; top: 0.75rem; right: 0.75rem; bottom: 0;
-      overflow: hidden; white-space: pre;
+      pointer-events: none;
+      position: absolute;
+      left: 1.5rem;
+      top: 1.25rem;
+      right: 1.5rem;
+      bottom: max(1.25rem, 4vh);
+      overflow: hidden;
+      white-space: pre;
     }
     .caret-marker {
-      position: absolute; width: 2px; background: var(--accent); opacity: 0.85;
+      position: absolute;
+      width: 2px;
+      background: var(--accent);
+      opacity: 0.9;
       border-radius: 1px;
     }
     .caret-label {
-      position: absolute; transform: translateY(-120%); font-size: 0.65rem;
-      padding: 0.1rem 0.25rem; border-radius: 3px; color: #11111b; white-space: nowrap;
+      position: absolute;
+      transform: translateY(-120%);
+      font-size: 0.65rem;
+      padding: 0.12rem 0.35rem;
+      border-radius: 4px;
+      color: #202124;
+      background: #e8eaed;
+      white-space: nowrap;
+      font-weight: 500;
     }
   </style>
 </head>
 <body style="display:flex;flex-direction:column;height:100vh;">
-  <div id="toolbar">
-    <label>Server <input id="serverUrl" type="text" size="28" value="http://localhost:8080" /></label>
-    <label>Doc <input id="docId" type="text" size="12" value="main" /></label>
-    <label>Docs <select id="docSelect"></select></label>
-    <button type="button" id="btnNewDoc">New doc</button>
-    <button type="button" id="btnConnect">Connect</button>
-    <label title="Demo only">Fail replica <input id="failReplica" type="text" size="2" placeholder="1" /></label>
-    <button type="button" id="btnFail">Fail</button>
-    <span id="status">disconnected</span>
-    <span id="ver" style="font-size:0.8rem;color:var(--muted);">v —</span>
-  </div>
+  <header id="toolbar" role="toolbar" aria-label="Connection and document">
+    <span class="app-brand">DoomDraft</span>
+    <div class="toolbar-tools" title="main is the default doc; use New doc to add more. Id = address in the URL; Open = same list the server returns from GET /docs.">
+      <label>Server <input id="serverUrl" type="text" size="26" value="http://localhost:8080" spellcheck="false" /></label>
+      <label>Id <input id="docId" type="text" size="10" value="main" spellcheck="false" title="Document id in the path /doc/&lt;id&gt;/…" /></label>
+      <label>Open <select id="docSelect" aria-label="Documents on server (GET /docs)"></select></label>
+      <button type="button" id="btnNewDoc">New doc</button>
+      <button type="button" id="btnConnect">Connect</button>
+      <span class="demo" title="Simulates losing one Paxos replica (class demo only)">
+        <label>Fail replica <input id="failReplica" type="text" size="2" placeholder="1" inputmode="numeric" /></label>
+        <button type="button" id="btnFail">Fail</button>
+      </span>
+    </div>
+    <div id="status-wrap">
+      <span id="status">disconnected</span>
+      <span id="ver">v —</span>
+    </div>
+  </header>
   <div id="main">
     <div id="wrap">
       <textarea id="editor" spellcheck="false" placeholder="Connect, then type…"></textarea>

@@ -103,6 +103,8 @@
     overlay: () => document.getElementById('cursor-overlay'),
   };
 
+  let connectGen = 0;
+
   const s = {
     serverText: '',
     pending: /** @type {{seq:number, op:Op}[]} */ ([]),
@@ -123,8 +125,45 @@
     st.className = cls || '';
   }
 
-  function baseUrl() {
-    return el.server().value.replace(/\/$/, '');
+  /** Browser uses this for connection refused, CORS blocks, file://→http, etc. */
+  function describeFetchFailure(e) {
+    const msg = e && e.message != null ? String(e.message) : String(e);
+    if (e instanceof TypeError && /failed to fetch|load failed|networkerror/i.test(msg)) {
+      return (
+        msg +
+        ' — server not reachable or request blocked. Run ./build/pt-collab-server; ' +
+        'open http://localhost:8080/ (not file://); set Server to the exact host in the address bar ' +
+        '(localhost vs 127.0.0.1 must match if you are not using path-only /doc/… URLs).'
+      );
+    }
+    return msg;
+  }
+
+  /**
+   * When the configured server matches the page origin, return '' so requests
+   * use path-only URLs (/doc/…). That avoids cross-origin POST (e.g. page on
+   * http://localhost:8080 but Server field http://127.0.0.1:8080), which often
+   * fails with "Failed to fetch" while GET/EventSource still work.
+   */
+  function apiRoot() {
+    const raw = el.server().value.trim().replace(/\/$/, '');
+    let s = raw || 'http://localhost:8080';
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+    try {
+      const api = new URL(s);
+      if (location.protocol === 'http:' || location.protocol === 'https:') {
+        if (api.origin === new URL(location.href).origin) return '';
+      }
+      return api.origin;
+    } catch (_) {
+      return 'http://localhost:8080';
+    }
+  }
+
+  /** @param {string} path must start with / */
+  function apiUrl(path) {
+    const p = path.startsWith('/') ? path : '/' + path;
+    return apiRoot() + p;
   }
 
   function fullText() {
@@ -148,7 +187,7 @@
 
   async function refreshDocList() {
     const sel = el.docSelect();
-    const r = await fetch(baseUrl() + '/docs');
+    const r = await fetch(apiUrl('/docs'));
     if (!r.ok) return;
     const list = await r.json();
     sel.innerHTML = '';
@@ -161,6 +200,33 @@
     sel.value = el.doc().value;
   }
 
+  /** Apply local ack from POST /op body; SSE may duplicate the same version (ignored there). */
+  function ackPostIfStillInflight(version, seq) {
+    if (s.inflightSeq !== seq) {
+      sendPendingFront();
+      return;
+    }
+    if (!s.pending.length || s.pending[0].seq !== seq) {
+      s.inflightSeq = null;
+      sendPendingFront();
+      return;
+    }
+    if (version <= s.serverVersion) {
+      s.inflightSeq = null;
+      sendPendingFront();
+      return;
+    }
+    const { op: committed } = s.pending[0];
+    s.serverText = applyOp(s.serverText, committed);
+    s.pending.shift();
+    s.mySeqs.delete(seq);
+    s.inflightSeq = null;
+    s.serverVersion = version;
+    el.ver().textContent = 'v ' + s.serverVersion;
+    syncTextareaFromModel();
+    sendPendingFront();
+  }
+
   async function sendPendingFront() {
     if (s.inflightSeq !== null || !s.pending.length) return;
     const { seq, op } = s.pending[0];
@@ -168,7 +234,7 @@
     s.mySeqs.add(seq);
     const docId = el.doc().value;
     try {
-      const r = await fetch(baseUrl() + '/doc/' + encodeURIComponent(docId) + '/op', {
+      const r = await fetch(apiUrl('/doc/' + encodeURIComponent(docId) + '/op'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(opToWire(op, seq, clientId)),
@@ -177,9 +243,17 @@
         const t = await r.text();
         throw new Error(t || r.statusText);
       }
+      let version = /** @type {number|null} */ (null);
+      try {
+        const j = await r.json();
+        if (typeof j.version === 'number' && Number.isFinite(j.version)) version = j.version;
+      } catch (_) {
+        /* ignore malformed body */
+      }
+      if (version !== null && version > 0) ackPostIfStillInflight(version, seq);
     } catch (e) {
       console.error(e);
-      setStatus('send failed: ' + e, 'err');
+      setStatus('send failed: ' + describeFetchFailure(e), 'err');
       s.mySeqs.delete(seq);
       s.inflightSeq = null;
     }
@@ -273,7 +347,7 @@
     const pos = ta.selectionStart ?? 0;
     const docId = el.doc().value;
     try {
-      await fetch(baseUrl() + '/doc/' + encodeURIComponent(docId) + '/cursor', {
+      await fetch(apiUrl('/doc/' + encodeURIComponent(docId) + '/cursor'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ client_id: clientId, pos }),
@@ -281,22 +355,32 @@
     } catch (_) {}
   }
 
-  function disconnect() {
+  /** @param {{ reconnecting?: boolean }} [opts] */
+  function disconnect(opts) {
+    const reconnecting = !!(opts && opts.reconnecting);
     if (s.es) {
-      s.es.close();
+      const old = s.es;
       s.es = null;
+      // Closing the socket can fire onerror with CLOSED; clear handlers first
+      // so doc switches do not flash "stream closed" / look like a server crash.
+      old.onerror = null;
+      old.onopen = null;
+      old.close();
     }
     s.pending = [];
     s.mySeqs.clear();
     s.inflightSeq = null;
     s.peerCursors.clear();
     renderCursorOverlay();
-    setStatus('disconnected', '');
-    el.ver().textContent = 'v —';
+    if (!reconnecting) {
+      setStatus('disconnected', '');
+      el.ver().textContent = 'v —';
+    }
   }
 
   async function connect() {
-    disconnect();
+    const myGen = ++connectGen;
+    disconnect({ reconnecting: true });
     const docId = el.doc().value.trim();
     if (!docId) {
       setStatus('need doc id', 'err');
@@ -304,9 +388,11 @@
     }
     setStatus('loading…', '');
     try {
-      const r = await fetch(baseUrl() + '/doc/' + encodeURIComponent(docId));
+      const r = await fetch(apiUrl('/doc/' + encodeURIComponent(docId)));
+      if (myGen !== connectGen) return;
       if (!r.ok) throw new Error(await r.text());
       const j = await r.json();
+      if (myGen !== connectGen) return;
       s.serverText = j.text || '';
       s.serverVersion = j.version || 0;
       s.pending = [];
@@ -314,15 +400,18 @@
       el.ta().value = fullText();
       el.ver().textContent = 'v ' + s.serverVersion;
     } catch (e) {
+      if (myGen !== connectGen) return;
       console.error(e);
-      setStatus('load failed', 'err');
+      setStatus('load failed: ' + describeFetchFailure(e), 'err');
       return;
     }
 
-    const streamUrl = baseUrl() + '/doc/' + encodeURIComponent(docId) + '/stream';
+    if (myGen !== connectGen) return;
+    const streamUrl = apiUrl('/doc/' + encodeURIComponent(docId) + '/stream');
     const es = new EventSource(streamUrl);
     s.es = es;
     es.addEventListener('op', (ev) => {
+      if (s.es !== es) return;
       try {
         handleSSEOp(JSON.parse(ev.data));
       } catch (e) {
@@ -330,6 +419,7 @@
       }
     });
     es.addEventListener('cursor', (ev) => {
+      if (s.es !== es) return;
       try {
         handleSSECursor(JSON.parse(ev.data));
       } catch (e) {
@@ -339,11 +429,15 @@
     // EventSource fires onerror during normal reconnect attempts, not only on
     // fatal failure; avoid flashing "stream error" unless the socket is dead.
     es.onerror = () => {
+      if (s.es !== es) return;
       if (es.readyState === EventSource.CLOSED) {
         setStatus('stream closed', 'err');
       }
     };
-    es.onopen = () => setStatus('connected', 'ok');
+    es.onopen = () => {
+      if (s.es !== es) return;
+      setStatus('connected', 'ok');
+    };
   }
 
   function onInput() {
@@ -363,7 +457,7 @@
     const id = prompt('New document id (letters, digits, _.-):', 'notes');
     if (!id || !/^[A-Za-z0-9_.-]+$/.test(id)) return;
     try {
-      const r = await fetch(baseUrl() + '/docs', {
+      const r = await fetch(apiUrl('/docs'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
@@ -382,7 +476,7 @@
     const v = el.failR().value.trim();
     if (!v) return;
     try {
-      const r = await fetch(baseUrl() + '/admin/fail/' + encodeURIComponent(v), { method: 'POST' });
+      const r = await fetch(apiUrl('/admin/fail/' + encodeURIComponent(v)), { method: 'POST' });
       console.log(await r.text());
     } catch (e) {
       console.error(e);
@@ -390,12 +484,14 @@
   }
 
   function wireUi() {
-    el.btnConnect().addEventListener('click', () => connect());
+    el.btnConnect().addEventListener('click', () => {
+      connect().catch((e) => console.error(e));
+    });
     el.btnNew().addEventListener('click', () => onNewDoc());
     el.btnFail().addEventListener('click', () => onFail());
     el.docSelect().addEventListener('change', () => {
       el.doc().value = el.docSelect().value;
-      connect();
+      connect().catch((e) => console.error(e));
     });
     el.ta().addEventListener('input', onInput);
     el.ta().addEventListener('select', scheduleCursorPost);
@@ -407,7 +503,15 @@
     const q = new URLSearchParams(location.search);
     const su = q.get('server');
     const d = q.get('doc');
-    if (su) el.server().value = su;
+    if (su) {
+      el.server().value = su;
+    } else if (
+      (location.protocol === 'http:' || location.protocol === 'https:') &&
+      location.port === '8080'
+    ) {
+      // Page served from the collab server port → POST/SSE must hit same origin.
+      el.server().value = location.origin;
+    }
     if (d) el.doc().value = d;
   }
 
