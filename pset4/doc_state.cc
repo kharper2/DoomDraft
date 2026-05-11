@@ -73,7 +73,8 @@ std::vector<committed_op> read_ops(const pancy::pancydb& db, std::string_view do
         }
         try {
             doc_op op = deserialize(cell.value);
-            out.push_back(committed_op{cell.version, cid, seq, std::move(op)});
+            out.push_back(
+                committed_op{cell.version, cid, seq, std::move(op), {}});
         } catch (const std::invalid_argument&) {
             continue;
         }

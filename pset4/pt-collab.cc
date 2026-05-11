@@ -1123,6 +1123,21 @@ int main(int argc, char* argv[]) {
   std::print("DoomDraft server: doc=\"{}\" replicas={} listening on http://localhost:{}\n",
              doc_id, tester.nreplicas, port);
 
+  // cot::loop() returns when the driver has no pending work (no timers, no fd
+  // watches, no keepalives). After a short-lived HTTP connection closes, the
+  // accept coroutine can momentarily have nothing registered; combined with
+  // quiet replica timing the driver can go "idle" and exit main even though
+  // the server should keep running. Hold an untriggered keepalive so the
+  // process stays up until you stop it (Ctrl+C). Detach long-lived tasks so
+  // their coroutines are not destroyed when this function returns (they run
+  // until process exit).
+  cot::event server_lifetime;
+  cot::keepalive(std::move(server_lifetime));
+  http_task.detach();
+  for (auto& t : replica_tasks) {
+    t.detach();
+  }
+
   cot::loop();
   return 0;
 }

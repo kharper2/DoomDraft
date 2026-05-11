@@ -22,6 +22,9 @@ struct committed_op {
     uint64_t client_id = 0;
     uint64_t client_seq = 0;
     doc_op op;
+    // Optional human-readable client id (HTTP POST body). Empty when loaded
+    // from storage via read_ops (only the hashed key prefix exists there).
+    std::string client_id_label;
 };
 
 // Build PancyDB key for one op slot.

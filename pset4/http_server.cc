@@ -556,9 +556,10 @@ cot::task<> handle_post_op_doc(const cot::fd& f, const http_paxos_bridge& bridge
         co_return;
     }
     auto& cache = g_state.doc(doc_id);
-    cache.note_committed(collab::committed_op{
-        version, hashed_cid, static_cast<uint64_t>(*seq_opt), op
-    });
+    collab::committed_op co{version, hashed_cid,
+                            static_cast<uint64_t>(*seq_opt), std::move(op), {}};
+    co.client_id_label = *cid_opt;
+    cache.note_committed(co);
     std::string resp_body = std::format("{{\"version\":{}}}", version);
     co_await write_all(f, http_response(200, "OK", "application/json", resp_body));
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -605,13 +606,17 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
                 op_kind = "D";
                 op_payload = std::format("\"pos\":{},\"len\":{}", dl.pos, dl.len);
             }
+            std::string client_id_json =
+                c.client_id_label.empty()
+                    ? std::format("{}", c.client_id)
+                    : std::format("\"{}\"", json_escape(c.client_id_label));
             std::string ev = std::format(
                 "id: {}\n"
                 "event: op\n"
                 "data: {{\"version\":{},\"client_id\":{},\"seq\":{},"
                 "\"op\":{{\"type\":\"{}\",{}}}}}\n\n",
                 c.version,
-                c.version, c.client_id, c.client_seq, op_kind, op_payload);
+                c.version, client_id_json, c.client_seq, op_kind, op_payload);
             if (!co_await write_all(f, ev)) co_return;
             last_seen = c.version;
         }

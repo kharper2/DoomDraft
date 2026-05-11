@@ -53,45 +53,69 @@ std::optional<std::string> collab_model::check(const pancy::pancydb& db) {
     return std::nullopt;
 }
 
-// sync_committed_ops: for each peer, try to fetch peer's next expected op.
-// If found: pop our own op from pending (it's committed), or OT-transform
-// our pending ops against the remote op and apply it to local_text.
+// sync_committed_ops: pull newly committed ops in global commit order.
+// Paxos assigns a monotonic version per committed key; the correct OT order
+// is by that version, not by iterating peers 0..n-1. Each round we GET each
+// peer's next expected seq, pick the op with minimum version (tie: lower
+// peer), apply or pop pending, then advance that peer only; repeat until no
+// peer has a ready next op.
 cotamer::task<> collab_model::sync_committed_ops(
     editor_state& es, unsigned cid, uint64_t& serial) {
-    for (unsigned peer = 0; peer < nclients_; ++peer) {
-        uint64_t seq = es.peer_next_seq[peer];
-        std::string key = collab::op_key(doc_id_, peer, seq);
-        serial += serial_step();
-        co_await send_request<pancy::get_request>(es.leader, serial, key);
-        auto resp = co_await cot::attempt(
-            receive_response<pancy::get_response>(es.leader, serial),
-            cot::after(randomness().normal(3s, 1s))
-        );
-        if (!resp || resp->errcode != pancy::errc::ok || resp->value.empty()) {
-            continue;
+    while (true) {
+        bool have_best = false;
+        unsigned best_peer = 0;
+        uint64_t best_seq = 0;
+        pancy::version_type best_ver{};
+        collab::doc_op best_op{};
+
+        for (unsigned peer = 0; peer < nclients_; ++peer) {
+            uint64_t seq = es.peer_next_seq[peer];
+            std::string key = collab::op_key(doc_id_, peer, seq);
+            serial += serial_step();
+            co_await send_request<pancy::get_request>(es.leader, serial, key);
+            auto resp = co_await cot::attempt(
+                receive_response<pancy::get_response>(es.leader, serial),
+                cot::after(randomness().normal(3s, 1s))
+            );
+            if (!resp || resp->errcode != pancy::errc::ok || resp->value.empty()) {
+                continue;
+            }
+            collab::doc_op committed;
+            try {
+                committed = collab::deserialize(resp->value);
+            } catch (...) {
+                continue;
+            }
+            if (!have_best || resp->version < best_ver
+                || (resp->version == best_ver && peer < best_peer)) {
+                have_best = true;
+                best_peer = peer;
+                best_seq = seq;
+                best_ver = resp->version;
+                best_op = std::move(committed);
+            }
         }
-        collab::doc_op committed;
-        try {
-            committed = collab::deserialize(resp->value);
-        } catch (...) {
-            continue;
+
+        if (!have_best) {
+            break;
         }
-        if (peer == cid) {
+
+        if (best_peer == cid) {
             // Our own op was committed: pop it from the front of pending.
-            if (!es.pending.empty() && es.pending_seqs[0] == seq) {
+            if (!es.pending.empty() && es.pending_seqs[0] == best_seq) {
                 es.pending.erase(es.pending.begin());
                 es.pending_seqs.erase(es.pending_seqs.begin());
                 ++ops_committed;
             }
         } else {
             // Remote op: update local view and OT-transform pending against it.
-            collab::apply_op(es.local_text, committed);
+            collab::apply_op(es.local_text, best_op);
             for (auto& p : es.pending) {
-                p = collab::transform(p, committed);
+                p = collab::transform(p, best_op);
                 ++ops_transformed;
             }
         }
-        es.peer_next_seq[peer]++;
+        ++es.peer_next_seq[best_peer];
     }
 }
 
