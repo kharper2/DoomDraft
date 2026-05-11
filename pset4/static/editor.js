@@ -186,6 +186,12 @@
   }
 
   function handleSSEOp(data) {
+    // GET /doc/<id> already returns full text at serverVersion. The stream replays
+    // all committed ops from version 0 for new connections, so without this
+    // guard we would apply every historical op again (reload / second tab breaks).
+    if (data.version <= s.serverVersion) {
+      return;
+    }
     const ta = el.ta();
     if (s.pending.length && data.seq === s.pending[0].seq && s.mySeqs.has(data.seq)) {
       const committed = wireToOp(data.op);
@@ -330,7 +336,13 @@
         console.error(e);
       }
     });
-    es.onerror = () => setStatus('stream error (reconnecting…)', 'err');
+    // EventSource fires onerror during normal reconnect attempts, not only on
+    // fatal failure; avoid flashing "stream error" unless the socket is dead.
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) {
+        setStatus('stream closed', 'err');
+      }
+    };
     es.onopen = () => setStatus('connected', 'ok');
   }
 
@@ -405,6 +417,7 @@
     try {
       await refreshDocList();
     } catch (_) {}
+    await connect();
   }
 
   /* ---- Console tests (same vectors as doc_ops.cc smoke tests) ---- */

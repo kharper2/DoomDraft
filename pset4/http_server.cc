@@ -428,6 +428,8 @@ std::string json_escape(std::string_view s) {
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
+            case '{':  out += "\\u007b"; break;
+            case '}':  out += "\\u007d"; break;
             default:
                 if (static_cast<unsigned char>(c) < 0x20) {
                     out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
@@ -436,6 +438,64 @@ std::string json_escape(std::string_view s) {
                 }
         }
     }
+    return out;
+}
+
+// One SSE op event: single-line `data:` JSON (no std::format on user text).
+std::string sse_op_frame(const collab::committed_op& c) {
+    std::string op_inner;
+    if (auto* in = std::get_if<collab::insert_op>(&c.op)) {
+        op_inner.reserve(24 + in->text.size() * 2);
+        op_inner += "\"type\":\"I\",\"pos\":";
+        op_inner += std::to_string(in->pos);
+        op_inner += ",\"text\":\"";
+        op_inner += json_escape(in->text);
+        op_inner += '\"';
+    } else {
+        const auto& dl = std::get<collab::delete_op>(c.op);
+        op_inner = "\"type\":\"D\",\"pos\":";
+        op_inner += std::to_string(dl.pos);
+        op_inner += ",\"len\":";
+        op_inner += std::to_string(dl.len);
+    }
+    std::string cid_json =
+        c.client_id_label.empty()
+            ? std::to_string(c.client_id)
+            : (std::string("\"") + json_escape(c.client_id_label) + '\"');
+
+    std::string data;
+    data.reserve(64 + op_inner.size());
+    data += "{\"version\":";
+    data += std::to_string(c.version);
+    data += ",\"client_id\":";
+    data += cid_json;
+    data += ",\"seq\":";
+    data += std::to_string(c.client_seq);
+    data += ",\"op\":{";
+    data += op_inner;
+    data += "}}";
+
+    std::string out;
+    out.reserve(32 + data.size());
+    out += "id: ";
+    out += std::to_string(c.version);
+    out += "\nevent: op\ndata: ";
+    out += data;
+    out += "\n\n";
+    return out;
+}
+
+std::string sse_cursor_frame(const cursor_entry& cur) {
+    std::string body = "{\"client_id\":\"";
+    body += json_escape(cur.client_id);
+    body += "\",\"pos\":";
+    body += std::to_string(cur.pos);
+    body += ",\"version\":";
+    body += std::to_string(cur.version);
+    body += '}';
+    std::string out = "event: cursor\ndata: ";
+    out += body;
+    out += "\n\n";
     return out;
 }
 
@@ -593,42 +653,33 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
     auto last_heartbeat = cot::steady_now();
     while (true) {
         auto& cache = g_state.doc(doc_id);
-        for (const auto& c : cache.ops_) {
+        // Copy before iterating: POST /op (note_committed), POST /cursor, and
+        // poll_doc_cache can mutate ops_/cursors_ while this coroutine is
+        // suspended in write_all/after. Range-for on a live vector/map is UB
+        // if another task reallocates — manifests as dropped SSE / "stream
+        // error" in the browser as soon as commits race the stream loop.
+        const std::vector<collab::committed_op> ops_snap = cache.ops_;
+        for (const auto& c : ops_snap) {
             if (c.version <= last_seen) continue;
-            std::string op_kind;
-            std::string op_payload;
-            if (auto* in = std::get_if<collab::insert_op>(&c.op)) {
-                op_kind = "I";
-                op_payload = std::format(
-                    "\"pos\":{},\"text\":\"{}\"", in->pos, json_escape(in->text));
-            } else {
-                auto& dl = std::get<collab::delete_op>(c.op);
-                op_kind = "D";
-                op_payload = std::format("\"pos\":{},\"len\":{}", dl.pos, dl.len);
+            const std::string ev = sse_op_frame(c);
+            if (!co_await write_all(f, ev)) {
+                std::print(std::cerr, "SSE op write failed (doc {})\n", doc_id);
+                co_return;
             }
-            std::string client_id_json =
-                c.client_id_label.empty()
-                    ? std::format("{}", c.client_id)
-                    : std::format("\"{}\"", json_escape(c.client_id_label));
-            std::string ev = std::format(
-                "id: {}\n"
-                "event: op\n"
-                "data: {{\"version\":{},\"client_id\":{},\"seq\":{},"
-                "\"op\":{{\"type\":\"{}\",{}}}}}\n\n",
-                c.version,
-                c.version, client_id_json, c.client_seq, op_kind, op_payload);
-            if (!co_await write_all(f, ev)) co_return;
             last_seen = c.version;
         }
-        if (cache.cursor_epoch_ != last_cursor_epoch) {
-            for (const auto& [cid_hash, cur] : cache.cursors_) {
-                std::string cev = std::format(
-                    "event: cursor\n"
-                    "data: {{\"client_id\":\"{}\",\"pos\":{},\"version\":{}}}\n\n",
-                    json_escape(cur.client_id), cur.pos, cur.version);
-                if (!co_await write_all(f, cev)) co_return;
+        const uint64_t epoch_snap = cache.cursor_epoch_;
+        const std::map<uint64_t, cursor_entry> cursors_snap = cache.cursors_;
+        if (epoch_snap != last_cursor_epoch) {
+            for (const auto& p : cursors_snap) {
+                const cursor_entry& cur = p.second;
+                const std::string cev = sse_cursor_frame(cur);
+                if (!co_await write_all(f, cev)) {
+                    std::print(std::cerr, "SSE cursor write failed (doc {})\n", doc_id);
+                    co_return;
+                }
             }
-            last_cursor_epoch = cache.cursor_epoch_;
+            last_cursor_epoch = epoch_snap;
         }
 
         auto now = cot::steady_now();

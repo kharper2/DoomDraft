@@ -4,6 +4,7 @@
 #include "pancydb.hh"
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <deque>
 #include <map>
 #include <optional>
@@ -1122,24 +1123,26 @@ int main(int argc, char* argv[]) {
 
   std::print("DoomDraft server: doc=\"{}\" replicas={} listening on http://localhost:{}\n",
              doc_id, tester.nreplicas, port);
+  std::fflush(stdout);
 
-  // cot::loop() returns when the driver has no pending work (no timers, no fd
-  // watches, no keepalives). After a short-lived HTTP connection closes, the
-  // accept coroutine can momentarily have nothing registered; combined with
-  // quiet replica timing the driver can go "idle" and exit main even though
-  // the server should keep running. Hold an untriggered keepalive so the
-  // process stays up until you stop it (Ctrl+C). Detach long-lived tasks so
-  // their coroutines are not destroyed when this function returns (they run
-  // until process exit).
-  cot::event server_lifetime;
-  cot::keepalive(std::move(server_lifetime));
+  // cot::loop() returns when the driver thinks there is no pending work. We
+  // register an untriggered keepalive so that should not happen; detached
+  // long-lived tasks are not tied to task<> destructors. If the driver still
+  // returns (cotamer edge cases, clearing paths, etc.), re-arm keepalive and
+  // call loop() again so the HTTP server process does not exit until SIGINT.
   http_task.detach();
   for (auto& t : replica_tasks) {
     t.detach();
   }
 
-  cot::loop();
-  return 0;
+  for (;;) {
+    cot::event server_lifetime;
+    cot::keepalive(std::move(server_lifetime));
+    cot::loop();
+    std::print(std::cerr,
+               "pt-collab-server: cot::loop() returned unexpectedly; "
+               "re-arming keepalive and continuing.\n");
+  }
 }
 
 #endif // PT_COLLAB_SERVER
