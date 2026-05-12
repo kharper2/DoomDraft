@@ -956,12 +956,88 @@ bool try_one_seed(testinfo& tester, unsigned long seed) {
       return false;
     }
   }
+
+  // Stricter invariant for writeups: every *available* replica matches the
+  // current Raft leader's reconstructed doc (not only the max-applied peer).
+  size_t leader_idx = tester.nreplicas;
+  for (size_t s = 0; s != tester.nreplicas; ++s) {
+    if (!inst.replica_available[s]) continue;
+    if (inst.replicas[s]->role_ == replica_role::leader) {
+      leader_idx = s;
+      break;
+    }
+  }
+  if (leader_idx < tester.nreplicas) {
+    auto leader_ops = collab::read_ops(inst.replicas[leader_idx]->db_, DOC_ID);
+    const std::string leader_text = collab::reconstruct(leader_ops);
+    for (size_t s = 0; s != tester.nreplicas; ++s) {
+      if (!inst.replica_available[s]) continue;
+      auto s_ops = collab::read_ops(inst.replicas[s]->db_, DOC_ID);
+      const std::string s_text = collab::reconstruct(s_ops);
+      if (s_text != leader_text) {
+        std::print(std::clog,
+                   "*** TEXT DIVERGENCE vs leader R{} on seed {} (leader R{})\n"
+                   "    R{}: {:?}\n    R{}: {:?}\n",
+                   s, seed, leader_idx, leader_idx, leader_text, s, s_text);
+        return false;
+      }
+    }
+  }
+
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
+#ifndef PT_COLLAB_SERVER
+static const char* failure_schedule_label(failure_schedule_kind k) {
+  switch (k) {
+  case failure_schedule_kind::none:
+    return "none";
+  case failure_schedule_kind::failover:
+    return "failover";
+  case failure_schedule_kind::recover:
+    return "recover";
+  case failure_schedule_kind::split:
+    return "split";
+  case failure_schedule_kind::unstable:
+    return "unstable";
+  case failure_schedule_kind::torture:
+    return "torture";
+  case failure_schedule_kind::random:
+    return "random";
+  default:
+    return "?";
+  }
+}
+
+// Fixed-seed Paxos+collab runs with failure schedules (fast simulated time).
+// Encodes: after schedule completes, no TEXT DIVERGENCE and all live replicas
+// match the leader's reconstructed document.
+static bool run_scheduled_collab_convergence_tests() {
+  const struct {
+    failure_schedule_kind kind;
+    unsigned long seed;
+  } cases[] = {
+      {failure_schedule_kind::unstable, 0x42},
+      {failure_schedule_kind::unstable, 0xC0DA26200427ULL},
+      {failure_schedule_kind::failover, 99},
+      {failure_schedule_kind::recover, 7},
+  };
+  testinfo t{};
+  t.nreplicas = 3;
+  t.loss = 0.0;
+  for (const auto& c : cases) {
+    t.failure_schedule = c.kind;
+    std::print("collab convergence: -f {} -S {}\n",
+               failure_schedule_label(c.kind), c.seed);
+    if (!try_one_seed(t, c.seed)) {
+      std::print(std::clog,
+                 "*** scheduled collab convergence failed (-f {} -S {})\n",
+                 failure_schedule_label(c.kind), c.seed);
+      return false;
+    }
+  }
+  return true;
+}
 
 static std::optional<failure_schedule_kind>
 parse_failure_schedule(const std::string& s) {
@@ -985,8 +1061,6 @@ static struct option options[] = {
     {"print-db",     no_argument,       nullptr, 'p'},
     {"test",         no_argument,       nullptr, 't'},
     {nullptr, 0, nullptr, 0}};
-
-#ifndef PT_COLLAB_SERVER
 
 int main(int argc, char* argv[]) {
   testinfo tester;
@@ -1027,7 +1101,13 @@ int main(int argc, char* argv[]) {
   if (run_tests) {
     std::print("Running doc_state tests...\n");
     collab::test_doc_state();
-    std::print("All tests passed. (Run ./build/test-doc-ops for full OT tests.)\n");
+    std::print("Running scheduled collab Paxos+failure convergence (fixed seeds)...\n");
+    if (!run_scheduled_collab_convergence_tests()) {
+      return 1;
+    }
+    std::print(
+        "All tests passed. (Also run ./build/test-doc-ops for full OT tests; "
+        "bash collab-bench.sh for a larger random-seed campaign.)\n");
     return 0;
   }
 
