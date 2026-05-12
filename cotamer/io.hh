@@ -1,6 +1,7 @@
 #pragma once
 #include "cotamer/cotamer.hh"
 #include <cerrno>
+#include <csignal>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -31,11 +32,19 @@
 
 namespace cotamer {
 
+// Return the current error as a C++ standard object.
+
+inline std::error_code errno_code() {
+    return std::error_code(errno, std::generic_category());
+}
+
 inline std::system_error errno_error() {
     return std::system_error(errno, std::generic_category());
 }
 
+
 // Set a raw file descriptor to non-blocking mode.
+
 inline void set_nonblocking(int fileno) {
     int flags = fcntl(fileno, F_GETFL, 0);
     if (flags < 0 || fcntl(fileno, F_SETFL, flags | O_NONBLOCK) < 0) {
@@ -49,8 +58,33 @@ inline void set_nonblocking(const fd& f) {
     }
 }
 
-// Reads up to count bytes. Suspends on EAGAIN. Returns bytes read.
-inline task<size_t> read_once(const fd& f, void* buf, size_t count) {
+
+// Ignore SIGPIPE. Prefer `set_no_sigpipe` or using `send`/`recv` to ignore
+// SIGPIPE on a specific socket; as a last resort, fall back to
+// `ignore_sigpipe()` process-wide.
+
+#ifdef SO_NOSIGPIPE
+inline void set_no_sigpipe(int fileno) {
+    int flag = 1;
+    if (setsockopt(fileno, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(flag)) < 0) {
+        throw errno_error();
+    }
+}
+#endif
+
+#ifndef MSG_NOSIGNAL
+# define MSG_NOSIGNAL 0
+#endif
+
+inline void ignore_sigpipe() {
+    signal(SIGPIPE, SIG_IGN);
+}
+
+
+// Read up to count bytes. Suspends on EAGAIN. Returns bytes read or error
+// code.
+
+inline task<ioresult> read_once(fd f, void* buf, size_t count) {
     while (true) {
         ssize_t r = ::read(f.fileno(), buf, count);
         if (r >= 0) {
@@ -58,13 +92,16 @@ inline task<size_t> read_once(const fd& f, void* buf, size_t count) {
         } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             co_await readable(f);
         } else {
-            throw errno_error();
+            co_return std::unexpected(errno_code());
         }
     }
 }
 
-// Writes up to count bytes. Suspends on EAGAIN. Returns bytes written.
-inline task<size_t> write_once(const fd& f, const void* buf, size_t count) {
+
+// Write up to count bytes. Suspends on EAGAIN. Returns bytes written or error
+// code.
+
+inline task<ioresult> write_once(fd f, const void* buf, size_t count) {
     while (true) {
         ssize_t r = ::write(f.fileno(), buf, count);
         if (r >= 0) {
@@ -72,13 +109,15 @@ inline task<size_t> write_once(const fd& f, const void* buf, size_t count) {
         } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
             co_await writable(f);
         } else {
-            throw errno_error();
+            co_return std::unexpected(errno_code());
         }
     }
 }
 
-// Reads all n bytes, suspending as needed. Returns bytes read.
-inline task<size_t> read(const fd& f, void* buf, size_t count) {
+
+// Read n bytes, suspending as needed. Returns bytes read or error code.
+
+inline task<ioresult> read(fd f, void* buf, size_t count) {
     char* p = static_cast<char*>(buf);
     size_t nr = 0;
     do {
@@ -92,14 +131,16 @@ inline task<size_t> read(const fd& f, void* buf, size_t count) {
         } else if (nr > 0) {
             break;
         } else {
-            throw errno_error();
+            co_return std::unexpected(errno_code());
         }
     } while (nr != count);
     co_return nr;
 }
 
-// Writes all n bytes, suspending as needed. Returns bytes written.
-inline task<size_t> write(const fd& f, const void* buf, size_t count) {
+
+// Write n bytes, suspending as needed. Returns bytes written or error code.
+
+inline task<ioresult> write(fd f, const void* buf, size_t count) {
     const char* p = static_cast<const char*>(buf);
     size_t nw = 0;
     do {
@@ -115,14 +156,122 @@ inline task<size_t> write(const fd& f, const void* buf, size_t count) {
         } else if (nw > 0) {
             break;
         } else {
-            throw errno_error();
+            co_return std::unexpected(errno_code());
         }
     } while (nw != count);
     co_return nw;
 }
 
+
+// Receive a message of up to `count` bytes. Suspends on EAGAIN. Returns bytes
+// read or error code.
+
+inline task<ioresult> recv(fd f, void* buf, size_t count, int flags) {
+    struct msghdr mh{};
+    struct iovec iov[1];
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 1;
+    iov[0].iov_base = buf;
+    iov[0].iov_len = count;
+    co_return co_await recvmsg(std::move(f), &mh, flags);
+}
+
+
+// Send a message of up to `count` bytes. Suspends on EAGAIN. Returns bytes
+// written or error code.
+
+inline task<ioresult> send(fd f, const void* buf, size_t count, int flags) {
+    struct msghdr mh{};
+    struct iovec iov[1];
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 1;
+    iov[0].iov_base = const_cast<void*>(buf);
+    iov[0].iov_len = count;
+    co_return co_await sendmsg(std::move(f), &mh, flags);
+}
+
+
+// Send a message defined by `iov`. Suspends on EAGAIN. Returns bytes written
+// or error code.
+
+inline task<ioresult> sendv(fd f, const iovec* iov, size_t iovcnt, int flags) {
+    struct msghdr mh{};
+    mh.msg_iov = const_cast<iovec*>(iov);
+    mh.msg_iovlen = iovcnt;
+    co_return co_await sendmsg(std::move(f), &mh, flags);
+}
+
+
+// Send a message of `count` bytes, suspending as needed. Returns bytes written
+// or error code.
+
+inline task<ioresult> send_all(fd f, const void* buf, size_t count, int flags) {
+    return send(std::move(f), buf, count, flags | MSG_WAITALL);
+}
+
+
+// Send a message defined by `iov`, suspending as needed. Returns bytes written
+// or error code.
+
+inline task<ioresult> sendv_all(fd f, const iovec* iov, size_t iovcnt, int flags) {
+    return sendv(std::move(f), iov, iovcnt, flags | MSG_WAITALL);
+}
+
+
+// Receive a message of up to `count` bytes, capturing the sender's address
+// into `*addr`. On entry, `*addrlen` is the capacity of `addr`; on return, it
+// holds the actual address length. Suspends on EAGAIN. Returns bytes read or
+// error code.
+
+inline task<ioresult> recvfrom(fd f, void* buf, size_t count,
+                               sockaddr* addr, socklen_t* addrlen, int flags) {
+    struct msghdr mh{};
+    struct iovec iov[1];
+    iov[0].iov_base = buf;
+    iov[0].iov_len = count;
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 1;
+    mh.msg_name = addr;
+    mh.msg_namelen = addrlen ? *addrlen : 0;
+    auto r = co_await recvmsg(std::move(f), &mh, flags);
+    if (addrlen) {
+        *addrlen = mh.msg_namelen;
+    }
+    co_return r;
+}
+
+
+// Send a single datagram of `count` bytes to `addr`. Suspends on EAGAIN.
+// Returns bytes written or error code.
+
+inline task<ioresult> sendto(fd f, const void* buf, size_t count,
+                             const sockaddr* addr, socklen_t addrlen, int flags) {
+    struct msghdr mh{};
+    struct iovec iov[1];
+    iov[0].iov_base = const_cast<void*>(buf);
+    iov[0].iov_len = count;
+    mh.msg_iov = iov;
+    mh.msg_iovlen = 1;
+    mh.msg_name = const_cast<sockaddr*>(addr);
+    mh.msg_namelen = addrlen;
+    co_return co_await sendmsg(std::move(f), &mh, flags);
+}
+
+
+// Deprecated (backward compatibility)
+
+inline task<ioresult> recv_once(fd f, void* buf, size_t count) {
+    return recv(std::move(f), buf, count);
+}
+
+inline task<ioresult> send_once(fd f, const void* buf, size_t count) {
+    return send(std::move(f), buf, count);
+}
+
+
 // Connects to an address. Suspends until connected. Throws on error.
-inline task<> connect(const fd& f, const struct sockaddr* addr, socklen_t len) {
+
+inline task<> connect(fd f, const struct sockaddr* addr, socklen_t len) {
     int r = ::connect(f.fileno(), addr, len), err = 0;
     if (r == 0) {
         co_return;
@@ -141,12 +290,17 @@ inline task<> connect(const fd& f, const struct sockaddr* addr, socklen_t len) {
     }
 }
 
+
 // Accepts a connection. Returns new fd (with ownership). Throws on error.
-inline task<fd> accept(const fd& listen_fd) {
+
+inline task<fd> accept(fd listen_fd) {
     while (true) {
         int fileno = ::accept(listen_fd.fileno(), nullptr, nullptr);
         if (fileno >= 0) {
             set_nonblocking(fileno);
+#ifdef SO_NOSIGPIPE
+            set_no_sigpipe(fileno);
+#endif
             co_return fd(fileno);
         } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             throw errno_error();
@@ -155,7 +309,11 @@ inline task<fd> accept(const fd& listen_fd) {
     }
 }
 
-inline task<fd> tcp_accept(const fd& listen_fd) {
+
+// Accepts a connection from a TCP socket. In addition to `cotamer::accept`,
+// this function sets the TCP_NODELAY option.
+
+inline task<fd> tcp_accept(fd listen_fd) {
     auto f = co_await accept(listen_fd);
     // disable Nagle’s algorithm
     int flag = 1;
@@ -183,10 +341,10 @@ struct fd_batch {
     int size = 0;
     int index = 0;
 
-    static inline int mask_out(int mask) noexcept;
-    static inline int mask_in(const system_event_type&) noexcept;
+    static inline int mask_out(fdevent mask) noexcept;
+    static inline fdevent mask_in(const system_event_type&) noexcept;
 
-    inline void add(int pollfd, const fd_update& fdu, int old_mask);
+    inline void add(int pollfd, const fd_update& fdu, fdevent old_mask);
     inline void clear(int pollfd);
     inline std::optional<fd_update> pop() noexcept;
     void print_changes();
@@ -204,9 +362,9 @@ inline void fd_batch::clear(int pollfd) {
 }
 
 inline fd_event_set::~fd_event_set() {
-    if (capacity_ != 0) {
-        std::destroy(fdrs_, fdrs_ + capacity_);
-        std::allocator<fdrec>().deallocate(fdrs_, capacity_);
+    if (fdr_capacity_ != 0) {
+        std::destroy(fdrs_, fdrs_ + fdr_capacity_);
+        std::allocator<fdrec>().deallocate(fdrs_, fdr_capacity_);
     }
 }
 
@@ -221,9 +379,9 @@ inline int driver::pollfd() {
 }
 
 inline void driver::notify_close(int base_fd) {
-    if (auto pair = fds_.check_fd_close(base_fd)) {
+    if (auto pair = fds_.fd_close(base_fd)) {
         detail::fd_batch batch;
-        apply_fd_update(batch, {base_fd, 0, pair->second});
+        apply_fd_update(batch, {base_fd, fdevent::none, pair->second});
         batch.clear(pollfd());
         pair->first->remove_listener(this);
     }

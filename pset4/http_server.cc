@@ -288,13 +288,10 @@ std::string find_header(std::string_view head, std::string_view name) {
 cot::task<bool> write_all(const cot::fd& f, std::string_view s) {
     size_t off = 0;
     while (off < s.size()) {
-        try {
-            size_t n = co_await cot::write_once(f, s.data() + off, s.size() - off);
-            if (n == 0) co_return false;
-            off += n;
-        } catch (...) {
-            co_return false;
-        }
+        auto r = co_await cot::write_once(f, s.data() + off, s.size() - off);
+        if (!r) co_return false;
+        if (*r == 0) co_return false;
+        off += *r;
     }
     co_return true;
 }
@@ -307,14 +304,10 @@ cot::task<std::string> read_request_head(const cot::fd& f) {
     while (true) {
         if (buf.find("\r\n\r\n") != std::string::npos) break;
         if (buf.size() > 64 * 1024) break;
-        size_t n = 0;
-        try {
-            n = co_await cot::read_once(f, tmp, sizeof(tmp));
-        } catch (...) {
-            break;
-        }
-        if (n == 0) break;
-        buf.append(tmp, n);
+        auto r = co_await cot::read_once(f, tmp, sizeof(tmp));
+        if (!r) break;
+        if (*r == 0) break;
+        buf.append(tmp, *r);
     }
     co_return buf;
 }
@@ -348,14 +341,10 @@ request_line parse_request_line(std::string_view buf) {
 cot::task<bool> read_body(const cot::fd& f, std::string& body, size_t want) {
     char tmp[2048];
     while (body.size() < want) {
-        size_t n = 0;
-        try {
-            n = co_await cot::read_once(f, tmp, sizeof(tmp));
-        } catch (...) {
-            co_return false;
-        }
-        if (n == 0) co_return false;
-        body.append(tmp, n);
+        auto r = co_await cot::read_once(f, tmp, sizeof(tmp));
+        if (!r) co_return false;
+        if (*r == 0) co_return false;
+        body.append(tmp, *r);
     }
     co_return true;
 }

@@ -610,6 +610,86 @@ System architecture, HTTP/deployment design, browser demo, discussion/future wor
 
 ---
 
+## Chunk 11 — Person A (1 hr): Cotamer upstream upgrade + http_server port
+
+**Files:** `cotamer/*` (overwritten from upstream), `pset4/http_server.cc`
+
+Pulled an updated `cotamer/` from `https://github.com/readablesystems/cs2620-s26-psets` (the professor's reference tree), diagnosed the API break, ported the affected pset4 code, and re-ran the full test matrix to confirm no regressions.
+
+**Done when:** all rows of `collab-bench.sh` still pass on the new library *and* `pt-collab-server` builds and exercises every HTTP/SSE route correctly.
+
+---
+
+### Chunk 11 implementation log (Aengus, 2026-05-12)
+
+**Status: COMPLETE.** All previously-passing tests still pass; one perf observation (polling floor) deferred as future work.
+
+#### Upstream cotamer delta
+
+Overwrote `cotamer/` with a fresh clone of the upstream `cs2620-s26-psets/cotamer`. Three new files, six modified, three unchanged:
+
+| File | Status |
+|---|---|
+| `cotamer.hh`, `cotamer.cc`, `cotamer_impl.hh` | Modified |
+| `event_handle.hh` | Modified (significant: fdevent bitmask + epoch logic) |
+| `io.hh`, `io.cc` | Modified (significant: new `ioresult` return type) |
+| `circular_int.hh`, `small_vector.hh`, `timer_heap.hh` | Unchanged |
+| `config.hh.in`, `curl.hh/cc`, `http.hh/cc` | **New** (built-in HTTP/curl support) |
+
+**Breaking changes that touched pset4:**
+
+1. **`read_once` / `write_once` / `read` / `write`** now return `task<ioresult>` where `ioresult = std::expected<size_t, std::error_code>`. Previously returned `task<size_t>` and threw on error. Calls of the form `try { size_t n = co_await read_once(...); } catch (...) { ... }` no longer compile.
+2. **fd is now passed by value** to most I/O primitives (was `const fd&`). `cot::fd` remained copyable so `tcp_accept(listen_fd)` in a loop still works as written — no source change required.
+3. **`fdevent` is now a bitmask** (`read=1, write=2, close=4`) with `|` and `&` operators; was `0/1/2`. No direct uses in pset4, but cotamer internals shifted.
+4. **`clock::real_time` is now numerically distinct from `virtual_time`.** In the old library both were `= 0`, so `cot::set_clock(cot::clock::real_time)` in `pt-collab.cc:1168` was effectively a no-op. The server binary now actually runs on the wall clock — this is the correct behavior and matches what the code always intended.
+5. `cot::attempt` / `cot::first` / `cot::race` gained forwarding-reference signatures (`Ts&&...` instead of `Ts...`) and new return-type helpers (`task_alternative_type_t`, `task_attempt_type_t`). Existing call sites in `collab_model.cc`, `lockseq_model.cc`, `pt-collab.cc`, `pt-paxos.cc`, `http_server.cc` compile unchanged.
+6. New `cotamer/http.{hh,cc}` and `cotamer/curl.{hh,cc}` overlap with our hand-rolled `http_server.cc` — not a break, but optional cleanup for a future pass.
+
+#### What was changed in pset4
+
+**`pset4/http_server.cc`** — three sites in three helpers, all under the new `ioresult` shape:
+
+- `write_all` (line 288): replaced the `try { size_t n = co_await write_once(...); } catch (...) { co_return false; }` block with `auto r = co_await write_once(...); if (!r) co_return false; ... off += *r;`.
+- `read_request_head` (line 303): same pattern around `read_once`.
+- `read_body` (line 348): same pattern around `read_once`.
+
+No other pset4 source changes were necessary. `tcp_listen`/`tcp_accept`, the `cot::first` reception multiplexes, the `cot::attempt` retry coroutines, and `clock::real_time` all compile and behave correctly against the new library.
+
+#### Tests conducted
+
+Full integration matrix, run from `pset4/` after `rm -rf build && cmake -B build -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ && cmake --build build`.
+
+| # | Test | Command | Result |
+|---|---|---|---|
+| 1 | Clean rebuild (pre-fix) | `cmake --build build` | 3 expected compile errors in `http_server.cc` (the `ioresult` change); all other targets built clean |
+| 2 | OT unit tests | `./build/test-doc-ops` | PASS (7 cases, 846 randomized diamond checks) |
+| 3 | Doc-state unit tests | `./build/test-doc-state` | PASS (8 cases) |
+| 4 | Paxos smoke | `./build/pt-paxos -R 5` | PASS |
+| 5 | Collab `--test` mode | `./build/pt-collab --test` | PASS (fixed-seed failure schedules) |
+| 6 | Basic convergence | `./build/pt-collab -R 100` | PASS (100 seeds, exit 0, no divergence) |
+| 7 | Full bench matrix | `bash collab-bench.sh` | PASS — "All tests passed." (failover/recover/split/unstable/torture/high-loss) |
+| 8 | Server build (post-fix) | `cmake --build build --target pt-collab-server` | PASS |
+| 9 | curl matrix (10 routes) | `GET/POST /doc/<id>`, `/doc/<id>/op`, `/docs`, `/doc/<id>/cursor`, `/admin/fail/<id>`, static `/` and `/editor.js` | PASS (all expected versions + JSON shapes) |
+| 10 | SSE stream | `curl -N --max-time 6 http://localhost:18080/doc/main/stream` with two concurrent POSTs | PASS — historical ops, two live ops (insert + delete), heartbeat ping |
+| 11 | Two-tab browser demo | `./build/pt-collab-server --port 8080`, two Chrome tabs on `http://localhost:8080/` | Manual run by Aengus — edits propagate but visibly lagged (see note below) |
+
+#### Note — visibility latency floor (deferred)
+
+The two-tab demo works correctly but cross-tab visibility is noticeably slow. Root cause is the existing SSE design, not the cotamer upgrade:
+
+- `http_server.cc:731` — shared `poll_doc_cache` refreshes from PancyDB every **100 ms**.
+- `http_server.cc:681` — per-SSE-subscriber loop walks the cache and emits events every **250 ms**.
+
+Worst-case foreign-edit visibility is therefore ~350 ms (avg ~125 ms). This is the architectural floor of the polling design and was present before the upgrade — the upgrade just exposed it because `clock::real_time` now actually runs on wall clock (in the old library the no-op meant timer behavior was undefined-but-coincidentally-fine).
+
+Two mitigations identified, neither applied yet:
+1. **Cheap:** drop SSE loop interval at `http_server.cc:681` from `250ms` to `25ms`. Takes worst-case ~350 ms → ~125 ms.
+2. **Right fix:** event-driven fanout. Add a `cot::event` per doc that `poll_doc_cache` triggers when `version_` advances; SSE loop `co_await`s it instead of `cot::after(250ms)`. Latency becomes ~μs from cache update to subscriber wake.
+
+Leaving as future work — current behavior is functionally correct and passes every test in the matrix. If a polished demo is needed for submission, apply mitigation #1 (one-line change) as a follow-up.
+
+---
+
 ## Appendix — Course paper (pointer only)
 
 **Do not duplicate the full paper here.** The short academic writeup lives in:
@@ -634,7 +714,8 @@ All chunk specs, implementation logs, and checklists remain in **`linear.md`** a
 | 8 | B | 2 | Cursors, multi-doc, server binary |
 | 9 | A | 2 | Writeup (A sections) — **`WRITEUP.md`** §§1–5; Kathryn drafted; Aengus may tighten |
 | 10 | B | 2 | Writeup (B sections) — **`WRITEUP.md`** §§6–9 |
+| 11 | A | 1 | Cotamer upstream upgrade + `http_server.cc` ioresult port; full matrix re-verified |
 
-**Person A: 15 hours. Person B: 14 hours.**
+**Person A: 16 hours. Person B: 14 hours.**
 
 The key rule: each chunk's done criteria is a concrete, runnable test that the next person can independently verify before starting their chunk. If Chunk 4's 100-seed run fails, go back and fix Chunk 3 before moving forward — never carry bugs across a handoff.

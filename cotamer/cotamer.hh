@@ -5,6 +5,7 @@
 #include <coroutine>
 #include <deque>
 #include <exception>
+#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,7 +16,6 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include "cotamer/timer_heap.hh"
-#include "cotamer/event_handle.hh"
 
 // cotamer/cotamer.hh
 //    Public interface to the Cotamer coroutine library.
@@ -23,6 +23,22 @@
 // Define COTAMER_STATS to 1 to collect statistics.
 // #define COTAMER_STATS 1
 
+namespace cotamer {
+
+// fdevent - file descriptor event types
+
+enum class fdevent {
+    read = 1, write = 2, close = 4,
+    read_write = 3, read_close = 5, write_close = 6,
+    none = 0, all = 7
+};
+inline fdevent operator&(fdevent a, fdevent b) { return static_cast<fdevent>(int(a) & int(b)); }
+inline fdevent operator|(fdevent a, fdevent b) { return static_cast<fdevent>(int(a) | int(b)); }
+inline fdevent& operator|=(fdevent& a, fdevent b) { a = a | b; return a; }
+inline bool operator!(fdevent e) { return e != fdevent::none; }
+
+}
+#include "cotamer/event_handle.hh"
 namespace cotamer {
 
 // event
@@ -35,7 +51,7 @@ class event {
 public:
     inline event();
     inline event(detail::event_handle ev);
-    explicit inline event(nullptr_t);
+    explicit inline event(nullptr_t);          // construct already-triggered event
     ~event() = default;
     event(const event&) = default;
     event(event&&) = default;
@@ -45,6 +61,9 @@ public:
     inline bool triggered() const noexcept;    // has triggered
     inline bool idle() const noexcept;         // has no listeners
     inline bool empty() const noexcept;        // can be garbage collected
+
+    inline int user_flags() const noexcept;
+    inline void set_user_flags(int fl);
 
     inline bool trigger();
     inline event& arm();
@@ -85,6 +104,7 @@ public:
 
     inline task() noexcept = default;  // construct empty task
     explicit inline task(handle_type handle) noexcept;
+    inline task(event e) noexcept requires std::is_void_v<T>;
     inline task(task&& x) noexcept;
     inline task& operator=(task&& x) noexcept;
     task(const task&) = delete;
@@ -106,8 +126,12 @@ public:
 
     detail::task_awaiter<T> operator co_await() const noexcept;
 
+    inline const promise_type* promise_ptr() const noexcept;
+    inline promise_type* promise_ptr() noexcept;
+
 private:
     friend struct detail::task_promise<T>;
+    friend task<T> forward<>(task<T>);
     handle_type handle_;
 };
 
@@ -132,29 +156,24 @@ template <typename... Es> inline event all(Es&&... es);
 // result (wrapped in optional) if the task completes first, or nullopt if
 // one of the events triggers first.
 template <typename T, typename... Es>
-[[nodiscard]] task<std::optional<T>> attempt(task<T> t, Es... es);
-template <typename T, typename... Es>
-[[nodiscard]] task<std::optional<T>> attempt(task<std::optional<T>> t, Es... es);
-template <typename... Es>
-[[nodiscard]] task<std::optional<std::monostate>> attempt(task<void> t, Es... es);
+[[nodiscard]] task<std::optional<task_attempt_type_t<T>>> attempt(T&& t, Es&&... es);
 
 // first(task...) - run several tasks and return the result of the first one
 // that completes (wrapped in variant).
 
-template <typename T> struct task_return_type {};
-template <typename T> struct task_return_type<task<T>> { using type = T; };
-template <> struct task_return_type<task<void>> { using type = std::monostate; };
-template <> struct task_return_type<event> { using type = std::monostate; };
-template <typename T> using task_return_type_t = typename task_return_type<T>::type;
-
 template <typename... Ts>
-[[nodiscard]] task<std::variant<task_return_type_t<Ts>...>> first(Ts... ts);
+[[nodiscard]] task<std::variant<task_alternative_type_t<Ts>...>> first(Ts&&... ts);
 
 // race(task...) - run several tasks, all of the same type, and return the result
 // of the first one that completes (unwrapped).
-template <typename T, typename... Ts>
-[[nodiscard]] task<T> race(task<T>, Ts... rest);
-[[nodiscard]] inline task<> race();
+template <typename... Ts>
+[[nodiscard]] task<common_task_value_type_t<Ts...>> race(Ts&&... rest);
+template <typename T>
+[[nodiscard]] task<T> race();
+
+// forward(t) — forward t’s resolution points into the current coroutine.
+template <typename T>
+task<T> forward(task<T> t);
 
 
 // driver
@@ -170,8 +189,7 @@ using system_time_point = std::chrono::system_clock::time_point;
 using steady_time_point = std::chrono::steady_clock::time_point;
 using duration = std::chrono::steady_clock::duration;
 
-enum class clock { virtual_time = 0, real_time = 0 };
-enum class fdevent { read = 0, write = 1, close = 2 };
+enum class clock { virtual_time = 0, real_time };
 
 class driver {
 public:
@@ -206,7 +224,7 @@ public:
     template <typename Rep, typename Period>
     inline event after(const std::chrono::duration<Rep, Period>&);
 
-    inline event file_event(const cotamer::fd& f, fdevent type);
+    inline event file_event(const cotamer::fd& f, fdevent mask);
     inline void notify_close(int base_fileno);
 
     inline void loop();
@@ -217,6 +235,8 @@ public:
 
     // introspection
     inline size_t timer_size() const noexcept;
+    inline unsigned nfdctl() const noexcept;
+    inline const detail::fd_event_set& fds() const noexcept;
 
     static thread_local std::unique_ptr<driver> current;
 
@@ -330,10 +350,10 @@ public:
     inline fd& operator=(fd&&) noexcept;
     inline ~fd();
 
-    int fileno() const noexcept;
-    bool valid() const noexcept;
+    int fileno() const noexcept;               // underlying file descriptor
+    bool valid() const noexcept;               // is `fd` open?
     explicit operator bool() const noexcept;
-    void close();
+    void close();                              // close `fd`
 
     detail::fd_body* body() const noexcept { return body_; }
 
@@ -341,6 +361,7 @@ private:
     detail::fd_body* body_ = nullptr;
 };
 
+inline event file_event(const fd&, fdevent mask);
 inline event readable(const fd&);      // triggers when `read(fd)` won't block
 inline event writable(const fd&);      // triggers when `write(fd)` won't block
 inline event closed(const fd&);        // triggers when `fd` errors or closes
@@ -348,20 +369,38 @@ inline event closed(const fd&);        // triggers when `fd` errors or closes
 
 // File-related functions
 
+inline void ignore_sigpipe();
 inline void set_nonblocking(int fileno);
 inline void set_nonblocking(const fd& f);
 
-inline task<size_t> read_once(const fd& f, void* buf, size_t count);
-inline task<size_t> write_once(const fd& f, const void* buf, size_t count);
-inline task<size_t> read(const fd& f, void* buf, size_t count);
-inline task<size_t> write(const fd& f, const void* buf, size_t count);
+using ioresult = std::expected<size_t, std::error_code>;
+inline task<ioresult> read_once(fd f, void* buf, size_t count);
+inline task<ioresult> write_once(fd f, const void* buf, size_t count);
+inline task<ioresult> read(fd f, void* buf, size_t count);
+inline task<ioresult> write(fd f, const void* buf, size_t count);
+task<ioresult> writev(fd f, const iovec* iov, size_t iovcnt);
 
-inline task<> connect(const fd& f, const struct sockaddr* addr, socklen_t len);
-inline task<fd> accept(const fd& listen_fd);
+task<ioresult> recvmsg(fd f, msghdr* msg, int flags);
+task<ioresult> sendmsg(fd f, const msghdr* msg, int flags);
+inline task<ioresult> recv(fd f, void* buf, size_t count, int flags = 0);
+inline task<ioresult> send(fd f, const void* buf, size_t count, int flags = 0);
+inline task<ioresult> sendv(fd f, const void* buf, size_t count, int flags = 0);
+inline task<ioresult> send_all(fd f, const void* buf, size_t count, int flags = 0);
+inline task<ioresult> sendv_all(fd f, const iovec* iov, size_t iovcnt, int flags = 0);
+inline task<ioresult> recvfrom(fd f, void* buf, size_t count, sockaddr* addr, socklen_t* addrlen, int flags = 0);
+inline task<ioresult> sendto(fd f, const void* buf, size_t count, const sockaddr* addr, socklen_t addrlen, int flags = 0);
+[[deprecated("Use cot::recv")]] inline task<ioresult> recv_once(fd f, void* buf, size_t count);
+[[deprecated("Use cot::send")]] inline task<ioresult> send_once(fd f, const void* buf, size_t count);
+
+inline task<> connect(fd f, const struct sockaddr* addr, socklen_t len);
+inline task<fd> accept(fd listen_fd);
 
 task<fd> tcp_listen(std::string address, int backlog = 128);
 task<fd> tcp_connect(std::string address);
-inline task<fd> tcp_accept(const fd& listen_fd);
+inline task<fd> tcp_accept(fd listen_fd);
+
+task<fd> udp_listen(std::string address);
+task<fd> udp_connect(std::string address);
 
 
 // mutex, mutex_event, unique_lock, shared_lock
@@ -372,8 +411,6 @@ inline task<fd> tcp_accept(const fd& listen_fd);
 //    counterparts. For instance:
 //        cot::unique_lock guard(co_await mutex.lock());
 //    When that guard goes out of scope the mutex will automatically unlock.
-
-class mutex;
 
 template <bool shared>
 struct locked_mutex_t {
@@ -417,10 +454,12 @@ public:
     inline ~mutex() = default;
 
     [[nodiscard]] inline mutex_event<false> lock();
+    [[nodiscard]] inline mutex_event<false> lock(bool& notify);
     [[nodiscard]] inline bool try_lock();
     inline void unlock();
 
     [[nodiscard]] inline mutex_event<true> lock_shared();
+    [[nodiscard]] inline mutex_event<true> lock_shared(bool& notify);
     [[nodiscard]] inline bool try_lock_shared();
     inline void unlock_shared();
 
@@ -436,14 +475,14 @@ private:
     // protects waiters_, tracks information about lock
     std::atomic<latch_type> latch_ = 0;          // see mf_ constants
     // queue of events waiting for mutex; see `lock_impl`
-    std::deque<detail::event_handle> waiters_;
+    std::deque<std::pair<detail::event_handle, bool*>> waiters_;
 
     inline latch_type latch();
     inline void unlatch(latch_type);
     inline bool allow(bool shared, latch_type) const noexcept;
     inline bool waiter_shared(const detail::event_handle&) const noexcept;
     [[nodiscard]] inline latch_type notify_locked(latch_type);
-    void lock_impl(bool shared, detail::event_handle& ep);
+    void lock_impl(bool shared, detail::event_handle& ep, bool* notify);
     void unlock_impl(bool shared);
 };
 
@@ -466,7 +505,7 @@ public:
     unique_lock& operator=(const unique_lock&) = delete;
     inline ~unique_lock();
 
-    [[nodiscard]] inline task<> lock();
+    [[nodiscard]] inline mutex_event<false> lock();
     [[nodiscard]] inline bool try_lock();
     inline void unlock();
 
@@ -497,7 +536,7 @@ public:
     shared_lock& operator=(const shared_lock&) = delete;
     inline ~shared_lock();
 
-    [[nodiscard]] inline task<> lock();
+    [[nodiscard]] inline mutex_event<true> lock();
     [[nodiscard]] inline bool try_lock();
     inline void unlock();
 
@@ -515,10 +554,12 @@ private:
 
 
 
-// Error codes and exception type.
+// Error codes and exception type
 
 enum class cotamer_errc {
-    cross_driver_await = 1
+    cross_driver_await = 1,
+    detached_await = 2,
+    unreachable = 3
 };
 
 struct cotamer_error : std::logic_error {
@@ -531,7 +572,7 @@ private:
 };
 
 
-// Statistics.
+// Statistics
 
 #if COTAMER_STATS
 struct statistics {
@@ -543,8 +584,23 @@ struct statistics {
 extern statistics stats;
 #endif
 
+// co_await cot::describe(str) - associate str with current task promise
+// (noop unless COTAMER_STATS)
+inline detail::describe_task_awaiter describe(const std::string&);
 
-// Metaprogramming.
+
+// String helpers
+
+namespace strings {
+// Are the first `count` characters of `a` and `b` equal, ignoring ASCII case?
+inline bool ieq(const char* a, const char* b, size_t count) noexcept;
+
+// Are `a` and `b` equal, ignoring ASCII case?
+inline bool ieq(std::string_view a, std::string_view b) noexcept;
+}
+
+
+// Metaprogramming
 
 template <typename T> struct is_task : public std::false_type { };
 template <typename T> struct is_task<task<T>> : public std::true_type { };

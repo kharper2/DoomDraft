@@ -96,14 +96,19 @@ bool driver::loop(looptype lt) {
             }
         }
 
-        // register changes in interested file descriptor set
-        while (auto fdu = fds_.pop_update()) {
-            apply_fd_update(fdb, *fdu);
-        }
-
         // remove dead keepalives
         while (!keepalives_.empty() && keepalives_.back()->triggered()) {
             keepalives_.pop_back();
+        }
+
+        // if clearing, empty fds, keepalives, and timeouts
+        if (clearing_) {
+            process_clearing();
+        }
+
+        // register changes in interested file descriptor set
+        while (auto fdu = fds_.pop_update()) {
+            apply_fd_update(fdb, *fdu);
         }
 
         // exit if nothing to do
@@ -115,11 +120,6 @@ bool driver::loop(looptype lt) {
             && keepalives_.empty()) {
             clearing_ = false;
             return false;
-        }
-
-        // if clearing, empty fds, keepalives, and timeouts
-        if (clearing_) {
-            process_clearing();
         }
 
         // compute timeout
@@ -198,13 +198,13 @@ void driver::process_clearing() {
 
     // trigger all fd events (but coroutines throw rather than running)
     int fd = -1;
-    while (auto fdu = fds_.next_nonempty(fd)) {
+    while (auto fdu = fds_.next_known(fd)) {
         fd = fdu->fd;
-        for (int interest = 0; interest < 3; ++interest) {
-            if (auto eh = fds_.take(fd, interest, 0)) {
-                while (auto coh = eh->driver_trigger(this)) {
-                    coh();
-                }
+        auto wix = fds_.take_watch_list(fd, fdevent::all, 0);
+        while (wix) {
+            auto eh = fds_.pop_watch_list_event(wix);
+            while (auto coh = eh->driver_trigger(this)) {
+                coh();
             }
         }
     }
@@ -229,18 +229,36 @@ void reset() {
 namespace detail {
 
 bool task_promise_base::resolve() {
-    std::coroutine_handle<task_promise_base> handle = std::coroutine_handle<task_promise_base>::from_promise(*this);
-    while (!handle.done() && resolving_) {
-        if (home_ != driver::current.get()) {
-            throw cotamer_error(cotamer_errc::cross_driver_await);
+    auto handle = base_handle();
+    while (true) {
+        if (handle.done()) {
+            // coroutine has completed (NB resolving_ will be true:
+            // task_final_awaiter set it)
+            return true;
         }
+        if (!resolving_) {
+            // coroutine has not reached a resolution point
+            return false;
+        }
+        if (forwarded_) {
+            // this task was returned from cot::forward(), but co_await has
+            // not linked another task to it; it cannot be resolved yet
+            return false;
+        }
+        // move past resolution point and clear stale resolution event
         resolving_ = false;
-        handle();
+        resolution_ = nullptr;
+        // Once any cot::forward()ed awaitee has resolved, run this task to see
+        // if it can complete past its resolution point.
+        if (!forward_ || forward_->resolve()) {
+            if (home_ != driver::current.get()) {
+                throw cotamer_error(cotamer_errc::cross_driver_await);
+            }
+            in_resolve_ = true;
+            handle();
+            in_resolve_ = false;
+        }
     }
-    if (!handle.done()) {
-        resolution_ = event_handle(nullptr);
-    }
-    return handle.done();
 }
 
 }
@@ -263,13 +281,16 @@ inline bool mutex::allow(bool is_shared, latch_type l) const noexcept {
 inline auto mutex::notify_locked(latch_type l) -> latch_type {
     while (!waiters_.empty()) {
         auto& fw = waiters_.front();
-        if (!fw.empty()) {
-            bool fws = waiter_shared(fw);
+        if (!fw.first.empty()) {
+            bool fws = waiter_shared(fw.first);
             if (!allow(fws, l)) {
                 break;
             }
-            if (fw->trigger()) {
+            if (fw.first->trigger()) {
                 l += fws ? mf_lock_shared : mf_lock_excl;
+                if (fw.second) {
+                    *fw.second = true;
+                }
             }
         }
         waiters_.pop_front();
@@ -277,12 +298,15 @@ inline auto mutex::notify_locked(latch_type l) -> latch_type {
     return l;
 }
 
-void mutex::lock_impl(bool is_shared, detail::event_handle& e) {
+void mutex::lock_impl(bool is_shared, detail::event_handle& e, bool* notify) {
     latch_type l = latch();
     l = notify_locked(l);
     if (waiters_.empty() && allow(is_shared, l)) {
         if (e) {
             e->trigger();
+        }
+        if (notify) {
+            *notify = true;
         }
         l += is_shared ? mf_lock_shared : mf_lock_excl;
     } else {
@@ -292,7 +316,7 @@ void mutex::lock_impl(bool is_shared, detail::event_handle& e) {
         if (is_shared) {
             e->set_user_flags(detail::ef_user);
         }
-        waiters_.push_back(e);
+        waiters_.push_back({e, notify});
     }
     unlatch(l);
 }
@@ -304,7 +328,7 @@ void mutex::unlock_impl(bool is_shared) {
 }
 
 
-// error functions
+// Error functions
 
 cotamer_error::cotamer_error(cotamer_errc ec)
     : std::logic_error(message(ec)), errc_(ec) {
@@ -314,6 +338,10 @@ constexpr const char* cotamer_error::message(cotamer_errc ec) noexcept {
     switch (ec) {
     case cotamer_errc::cross_driver_await:
         return "cannot co_await a task created on a different driver";
+    case cotamer_errc::detached_await:
+        return "cannot co_await a detached task";
+    case cotamer_errc::unreachable:
+        return "executing unreachable code";
     default:
         return "unknown cotamer error";
     }

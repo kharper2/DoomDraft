@@ -1,0 +1,7 @@
+#pragma once
+// Generated from cotamer/config.hh.in by CMake. Do not edit.
+
+#define COTAMER_HAVE_CURL @COTAMER_HAVE_CURL@
+#define COTAMER_HAVE_LLHTTP @COTAMER_HAVE_LLHTTP@
+#define COTAMER_HAVE_NLOHMANN_JSON @COTAMER_HAVE_NLOHMANN_JSON@
+#define COTAMER_HAVE_ZLIB @COTAMER_HAVE_ZLIB@

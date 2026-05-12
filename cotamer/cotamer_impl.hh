@@ -33,8 +33,9 @@ constexpr uint32_t ef_want_interest = 32; // transitive quorum member has intere
 constexpr uint32_t ef_user = 64;          // first user flag
 constexpr uint32_t ef_nuser = 4;          // number of user flags
 constexpr uint32_t efm_user = 0x3C0;      // mask of user flags
+constexpr uint32_t efs_user = 6;          // shift to first user flag
 constexpr uint32_t ef_interest = 1024;    // this quorum has 1 interest{}
-                                          // (added once per interest{})
+                                          // (added once per interest{}; must be largest flag)
 
 // exception thrown during driver::clearing()
 struct clearing_exception {};
@@ -99,23 +100,35 @@ struct fd_body {
                 break;
             }
         }
-        bool del = drivers_.empty()
-            && ref_.load(std::memory_order_acquire) == 0;
+        if (!drivers_.empty()) {
+            unlock();
+            return;
+        }
+        // The fd_body should be deleted when unreferenced.
+        bool deletable = ref_.load(std::memory_order_acquire) == 0;
+        // The OS fd should be closed if close was explicitly requested
+        // (fd_ < 0) and the fd_body isn't registered on any driver
+        // (drivers_.empty() -- this branch).
+        int closable = fd_.load(std::memory_order_relaxed) < 0 ? base_fd_ : -1;
+        if (closable >= 0) {
+            base_fd_ = -1;
+        }
         unlock();
-        if (del) {
+        if (closable >= 0) {
+            ::close(closable);
+        }
+        if (deletable) {
             delete this;
         }
     }
 
     inline void deref() noexcept {
         if (ref_.load(std::memory_order_acquire) == 1) {
-            deref_close(true);
+            close(true);
         } else {
             ref_.fetch_sub(1, std::memory_order_release);
         }
     }
-
-    void deref_close(bool deref);         // non-inline, in cotamer.cc
 
     inline void lock() {
         while (lock_.test_and_set(std::memory_order_acquire)) {
@@ -126,6 +139,8 @@ struct fd_body {
     inline void unlock() {
         lock_.clear(std::memory_order_release);
     }
+
+    void close(bool because_deref);         // non-inline, in io.cc
 };
 
 
@@ -138,15 +153,32 @@ struct fd_body {
 //    defined by the C++ language standard; the runtime calls its methods in
 //    specific situations, such as when a `co_await` expression is evaluated.
 
+// Generic coroutine functionality involving suspension, resumption, resolution,
+// and interest is in the common `task_promise_base`, and we use functions like
+// std::coroutine_handle::from_address() to obtain a task_promise_base without
+// needing the precise type of the task. This is strictly speaking UB -- one can
+// only call coroutine_handle<T>::from_address() if T is the actual promise type
+// or void -- but it works on GCC and Clang when the actual promise type and the
+// base type have the same alignment. We check the alignment with static_assert.
+
 struct task_promise_base {
     bool detached_ = false;                // is this task detached?
     bool has_interest_ = false;            // has interest been requested?
     bool resolving_ = false;               // is task awaiting resolve{}?
+    bool forwarded_ = false;               // is task subject to cot::forward()?
+    bool in_resolve_ = false;              // is resolve() currently driving me?
     driver* home_;                         // coroutine home driver
     event_handle resolution_;              // resolution event (lazily created)
     event_handle interest_;                // interest event (lazily created)
-    // coroutine awaiting me, if any
-    std::coroutine_handle<task_promise_base> continuation_;
+    uintptr_t awaiter_ = 0UL;              // coroutine/event awaiting me
+    task_promise_base* forward_ = nullptr; // awaited forward coroutine, if any
+#if COTAMER_STATS
+    std::string description_;              // applied by co_await describe(str)
+#endif
+
+    // if awaiter_ == 0UL: no known awaiter
+    // otherwise, if (awaiter_ & 1UL) == 0: awaiter_ is coroutine address
+    // otherwise, if (awaiter_ & 1UL) != 0: (awaiter_ & ~1UL) is event_body address
 
     inline task_promise_base()
         : home_(driver::current.get()) {
@@ -156,32 +188,66 @@ struct task_promise_base {
         COTAMER_STAT_INCR(promises_destroyed);
     }
 
+    inline std::coroutine_handle<> base_handle() {
+        return std::coroutine_handle<task_promise_base>::from_promise(*this);
+    }
+    template <typename T>
+    static inline std::coroutine_handle<task_promise_base> convert_handle(std::coroutine_handle<task_promise<T>>);
+    inline constexpr task_promise_base* awaiter() const noexcept {
+        return awaiter_ & 1UL ? nullptr : reinterpret_cast<task_promise_base*>(awaiter_);
+    }
+    inline constexpr event_body* awaiter_event() const noexcept {
+        return awaiter_ & 1UL ? reinterpret_cast<event_body*>(awaiter_ - 1UL) : nullptr;
+    }
+    inline constexpr task_promise_base* active_awaiter() const noexcept {
+        auto* a = awaiter();
+        while (a && a->forward_) {
+            a = a->awaiter();
+        }
+        return a;
+    }
+    inline std::string description() const {
+#if COTAMER_STATS
+        if (!description_.empty()) {
+            return description_;
+        }
+#endif
+        return std::format("TP{{{:x}}}", reinterpret_cast<uintptr_t>(this));
+    }
+
     inline event_handle& make_interest();
+    inline event resolution();
     bool resolve();
+    inline std::coroutine_handle<> prepare_awaiter(task_promise_base&);
+    inline void clear_awaiter();
+    inline void resolution_point();
+
+    // Coroutine functionality common to any task<T>:
+    // - Behavior when coroutine starts (here, run eagerly):
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    // - Handle `co_await E` for different `E` types:
+    task_event_awaiter await_transform(event ev);
+    template <bool shared>
+    task_mutex_event_awaiter<shared> await_transform(mutex_event<shared> ev);
+    task_mutex_event_awaiter<false> await_transform(mutex&);
+    inline task_event_awaiter await_transform(interest);
+    inline interest_event_awaiter await_transform(interest_event);
+    inline task_resolution_awaiter await_transform(struct resolve);
+    template <typename Aw>
+    Aw&& await_transform(Aw&& aw) noexcept { return std::forward<Aw>(aw); }
+    // - Behavior after coroutine exits:
+    task_final_awaiter final_suspend() noexcept;
 };
+
 
 template <typename T>
 struct task_promise : public task_promise_base {
     // Functions required by the C++ runtime
     // - Initialize the task<T> return value that manages the coroutine:
     inline task<T> get_return_object() noexcept;
-    // - Behavior when coroutine starts (here, run eagerly):
-    std::suspend_never initial_suspend() noexcept { return {}; }
-    // - Handle `co_await E` for different `E` types:
-    task_event_awaiter<T> await_transform(event ev);
-    template <bool shared>
-    task_mutex_event_awaiter<T, shared> await_transform(mutex_event<shared> ev);
-    task_mutex_event_awaiter<T, false> await_transform(mutex&);
-    inline task_event_awaiter<T> await_transform(interest);
-    inline interest_event_awaiter await_transform(interest_event);
-    inline task_resolution_awaiter await_transform(struct resolve);
-    template <typename Aw>
-    Aw&& await_transform(Aw&& aw) noexcept { return std::forward<Aw>(aw); }
     // - Handle `co_return V` or throwing an exception in the coroutine:
     void return_value(T value) { result_.template emplace<1>(std::move(value)); }
     void unhandled_exception() noexcept { result_.template emplace<2>(std::current_exception()); }
-    // - Behavior after coroutine exits:
-    task_final_awaiter final_suspend() noexcept;
     // - Export coroutine return value to `co_await`er:
     inline T result();
 
@@ -190,12 +256,6 @@ struct task_promise : public task_promise_base {
 
 template <typename T>
 inline task<T> task_promise<T>::get_return_object() noexcept {
-    // When an event schedules a task_promise, it needs the task's home driver.
-    // It uses coroutine_handle<task_promise_base>::from_address() to get it.
-    // That is strictly speaking UB -- one can only call
-    // coroutine_handle<T>::from_address() if T is the actual promise type or
-    // void -- but it works on GCC and Clang when the actual promise type
-    // and the base type have the same alignment.
     static_assert(alignof(task_promise<T>) == alignof(task_promise_base));
     return task<T>{std::coroutine_handle<task_promise<T>>::from_promise(*this)};
 }
@@ -215,16 +275,6 @@ T task_promise<T>::result() {
 template <>
 struct task_promise<void> : public task_promise_base {
     inline task<void> get_return_object() noexcept;
-    std::suspend_never initial_suspend() noexcept { return {}; }
-    task_event_awaiter<void> await_transform(event ev);
-    template <bool shared>
-    task_mutex_event_awaiter<void, shared> await_transform(mutex_event<shared> ev);
-    inline task_mutex_event_awaiter<void, false> await_transform(mutex&);
-    inline task_event_awaiter<void> await_transform(interest);
-    inline interest_event_awaiter await_transform(interest_event);
-    inline task_resolution_awaiter await_transform(struct resolve);
-    template <typename Aw>
-    Aw&& await_transform(Aw&& aw) noexcept { return std::forward<Aw>(aw); }
     void return_void() noexcept { }
     void unhandled_exception() noexcept { exception_ = std::current_exception(); }
     void result() {
@@ -232,15 +282,19 @@ struct task_promise<void> : public task_promise_base {
             std::rethrow_exception(std::move(exception_));
         }
     }
-    inline task_final_awaiter final_suspend() noexcept;
 
     std::exception_ptr exception_;
 };
 
 inline task<void> task_promise<void>::get_return_object() noexcept {
-    // See comment in task_promise<T>::get_return_object.
     static_assert(alignof(task_promise<void>) == alignof(task_promise_base));
     return task<void>{std::coroutine_handle<task_promise<void>>::from_promise(*this)};
+}
+
+template <typename T>
+inline std::coroutine_handle<task_promise_base> task_promise_base::convert_handle(std::coroutine_handle<task_promise<T>> handle) {
+    static_assert(alignof(task_promise<T>) == alignof(task_promise_base));
+    return std::coroutine_handle<task_promise_base>::from_promise(handle.promise());
 }
 
 
@@ -252,35 +306,27 @@ inline task<void> task_promise<void>::get_return_object() noexcept {
 //
 //    task_awaiter<T> awaits a task. We also define task_final_awaiter,
 //    which handles the implicit final suspension when a coroutine completes;
-//    task_event_awaiter<T>, which awaits an event; and a few others.
+//    task_event_awaiter, which awaits an event; and a few others.
 
 template <typename T>
 struct task_awaiter {
     // - Return true if `co_await` should not suspend
     bool await_ready() noexcept {
-        return self_.done() || self_.promise().resolve();
+        return awaitee_.done() || awaitee_.promise().resolve();
     }
     // - Suspend this coroutine and return the next coroutine to execute
     template <typename U>
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<U>> awaiting) {
-        if (awaiting.promise().home_ != self_.promise().home_) {
-            throw cotamer_error(cotamer_errc::cross_driver_await);
-        }
-        // XXX UB, but see task_promise<T>::get_return_object
-        std::coroutine_handle<task_promise_base> base_awaiting =
-            std::coroutine_handle<task_promise_base>::from_address(awaiting.address());
-        self_.promise().continuation_ = base_awaiting;
-        if (self_.promise().interest_) {
-            self_.promise().interest_->trigger();
-        }
-        return std::noop_coroutine();
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<U>> awaiter) {
+        static_assert(alignof(task_promise<U>) == alignof(task_promise_base));
+        return awaitee_.promise().prepare_awaiter(awaiter.promise());
     }
     // - Resume this coroutine, returning the `co_await` expression’s result
     T await_resume() {
-        return self_.promise().result();
+        awaitee_.promise().clear_awaiter();
+        return awaitee_.promise().result();
     }
 
-    std::coroutine_handle<task_promise<T>> self_;
+    std::coroutine_handle<task_promise<T>> awaitee_;
 };
 
 
@@ -290,34 +336,12 @@ struct task_final_awaiter {
         return false;
     }
     template <typename T>
-    inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
-        auto& promise = self.promise();
-        // trigger resolution event, since the task is done
-        if (promise.resolution_) {
-            promise.resolution_->trigger();
-        }
-        // if another coroutine wants this task's result, resume it directly
-        // (cross-driver awaits are rejected at co_await time, so the
-        // continuation is always on the same driver)
-        if (promise.continuation_) {
-            return std::exchange(promise.continuation_, nullptr);
-        }
-        // destroy if detached and then return to event loop
-        if (promise.detached_) {
-            self.destroy();
-        }
-        return std::noop_coroutine();
-    }
+    inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept;
     void await_resume() noexcept {
     }
 };
 
-template <typename T>
-inline task_final_awaiter task_promise<T>::final_suspend() noexcept {
-    return {};
-}
-
-inline task_final_awaiter task_promise<void>::final_suspend() noexcept {
+inline task_final_awaiter task_promise_base::final_suspend() noexcept {
     return {};
 }
 
@@ -329,16 +353,13 @@ struct task_resolution_awaiter {
     }
     template <typename T>
     inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
-        auto& promise = self.promise();
-        if (promise.continuation_) {
-            // someone wants our value already, so keep running
+        auto& p = self.promise();
+        if (p.active_awaiter()) {
+            // someone actively wants our value, so keep running
             return self;
         }
-        if (promise.resolution_) {
-            promise.resolution_->trigger();
-        }
-        promise.resolving_ = true;
-        if (promise.detached_) {
+        p.resolution_point();
+        if (p.detached_) {
             self.destroy();
         }
         return std::noop_coroutine();
@@ -347,14 +368,25 @@ struct task_resolution_awaiter {
     }
 };
 
-template <typename T>
-inline task_resolution_awaiter task_promise<T>::await_transform(struct resolve) {
+inline task_resolution_awaiter task_promise_base::await_transform(struct resolve) {
     return task_resolution_awaiter{};
 }
 
-inline task_resolution_awaiter task_promise<void>::await_transform(struct resolve) {
-    return task_resolution_awaiter{};
-}
+
+// Awaiter for `cot::describe{}`.
+struct describe_task_awaiter {
+    bool await_ready() noexcept { return false; }
+    template <typename T>
+    inline std::coroutine_handle<> await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
+#if COTAMER_STATS
+        self.promise().description_ = description_;
+#endif
+        return self;
+    }
+    void await_resume() noexcept { }
+
+    std::string description_;
+};
 
 
 // make_event: converts various types into events.
@@ -470,9 +502,7 @@ struct event_body {
         flags_.store(flags, std::memory_order_release);
     }
 
-    template <typename T>
-    inline void add_listener_unlock(std::coroutine_handle<task_promise<T>> coroutine,
-                                    uint32_t flags) {
+    inline void add_listener_unlock(std::coroutine_handle<> coroutine, uint32_t flags) {
         add_listener_unlock(reinterpret_cast<uintptr_t>(coroutine.address()), flags);
     }
 
@@ -480,8 +510,7 @@ struct event_body {
         add_listener_unlock(reinterpret_cast<uintptr_t>(qb) | lf_quorum, flags);
     }
 
-    template <typename T>
-    inline void remove_listener(std::coroutine_handle<task_promise<T>> coroutine) {
+    inline void remove_listener(std::coroutine_handle<> coroutine) {
         remove_listener_unlock(reinterpret_cast<uintptr_t>(coroutine.address()), lock());
     }
 
@@ -547,17 +576,20 @@ private:
 //    that avoids allocating separate memory for `interest{}`.
 
 struct quorum_event_body : event_body {
-    template<typename... Es>
-    quorum_event_body(size_t quorum, Es&&... es)
+    static constexpr uint32_t ef_initial = ef_quorum | ef_empty | ef_empty_members;
+
+    quorum_event_body(size_t quorum)
         : quorum_(quorum) {
-        uint32_t qf = ef_quorum | ef_empty | ef_empty_members;
-        flags_.store(qf | ef_lock, std::memory_order_release);
-        ((qf = add_member(qf, std::forward<Es>(es))), ...);
-        if (triggered_ >= quorum_) {
-            trigger_unlock(qf);
-        } else {
-            unlock(qf);
-        }
+        flags_.store(ef_initial | ef_lock, std::memory_order_release);
+    }
+
+    template<typename... Es>
+    static quorum_event_body* make(size_t quorum, Es&&... es) {
+        quorum_event_body* qeb = new quorum_event_body(quorum);
+        uint32_t qf = ef_initial;
+        ((qf = qeb->add_member(qf, std::forward<Es>(es))), ...);
+        qeb->seal(qf);
+        return qeb;
     }
 
     uint32_t add_member(uint32_t qf, event_handle eh) {
@@ -581,6 +613,14 @@ struct quorum_event_body : event_body {
 
     inline uint32_t add_member(uint32_t qf, interest) {
         return (qf | ef_want_interest) + ef_interest;
+    }
+
+    inline void seal(uint32_t qf) {
+        if (triggered_ >= quorum_) {
+            trigger_unlock(qf);
+        } else {
+            unlock(qf);
+        }
     }
 
     // Called by a member event when it triggers. Removes that event from
@@ -812,19 +852,26 @@ inline void event_handle::swap(event_handle& x) noexcept {
     x.eb_ = tmp;
 }
 
+inline bool event_handle::triggered() const noexcept {
+    return !eb_ || eb_->triggered();
+}
+
 inline bool event_handle::empty() const noexcept {
     return !eb_ || eb_->empty();
 }
 
+inline bool event_handle::idle() const noexcept {
+    return !eb_ || eb_->idle();
+}
 
 
-// task_event_awaiter<T>
+
+// task_event_awaiter
 //    Awaiter for `co_await event` inside a task.
 
-template <typename T>
 struct task_event_awaiter {
     event_handle eh_;
-    std::coroutine_handle<task_promise<T>> coroutine_;
+    std::coroutine_handle<task_promise_base> coroutine_;
 
     ~task_event_awaiter() {
         if (coroutine_) {
@@ -832,8 +879,9 @@ struct task_event_awaiter {
         }
     }
     bool await_ready() noexcept {
-        return !eh_ || eh_->triggered();
+        return eh_.triggered();
     }
+    template <typename T>
     bool await_suspend(std::coroutine_handle<task_promise<T>> awaiting) noexcept {
         event_body* eb = eh_.get();
         // apply interest{} if necessary, which might trigger `eb`
@@ -844,7 +892,7 @@ struct task_event_awaiter {
         if (ef & ef_triggered) {
             return false;
         }
-        coroutine_ = awaiting;
+        coroutine_ = task_promise_base::convert_handle(awaiting);
         eb->add_listener_unlock(coroutine_, ef);
         return true;
     }
@@ -866,13 +914,8 @@ struct task_event_awaiter {
     }
 };
 
-template <typename T>
-inline task_event_awaiter<T> task_promise<T>::await_transform(event ev) {
-    return task_event_awaiter<T>{std::move(ev).handle(), nullptr};
-}
-
-inline task_event_awaiter<void> task_promise<void>::await_transform(event ev) {
-    return task_event_awaiter<void>{std::move(ev).handle(), nullptr};
+inline task_event_awaiter task_promise_base::await_transform(event ev) {
+    return task_event_awaiter{std::move(ev).handle(), nullptr};
 }
 
 
@@ -886,13 +929,8 @@ inline event_handle& task_promise_base::make_interest() {
     return interest_;
 }
 
-template <typename T>
-inline task_event_awaiter<T> task_promise<T>::await_transform(interest) {
-    return task_event_awaiter<T>{make_interest(), nullptr};
-}
-
-inline task_event_awaiter<void> task_promise<void>::await_transform(interest) {
-    return task_event_awaiter<void>{make_interest(), nullptr};
+inline task_event_awaiter task_promise_base::await_transform(interest) {
+    return task_event_awaiter{make_interest(), nullptr};
 }
 
 // make_event(interest)
@@ -900,7 +938,7 @@ inline task_event_awaiter<void> task_promise<void>::await_transform(interest) {
 //    `interest{}` appears as the sole argument to any()/all().
 
 inline event make_event(interest) {
-    auto q = new detail::quorum_event_body(1, interest{});
+    auto q = detail::quorum_event_body::make(1, interest{});
     return event_handle(q);
 }
 
@@ -913,12 +951,7 @@ struct interest_event_awaiter {
     event await_resume() { return event(std::move(handle_)); }
 };
 
-template <typename T>
-inline interest_event_awaiter task_promise<T>::await_transform(interest_event) {
-    return interest_event_awaiter{make_interest()};
-}
-
-inline interest_event_awaiter task_promise<void>::await_transform(interest_event) {
+inline interest_event_awaiter task_promise_base::await_transform(interest_event) {
     return interest_event_awaiter{make_interest()};
 }
 
@@ -961,12 +994,12 @@ inline void quorum_event_body::fix_want_interest(event_handle& ievent) {
 }
 
 
-// task_mutex_event_awaiter<T, shared>
+// task_mutex_event_awaiter<shared>
 //    Awaiter for `co_await mutex_event` inside a task.
 
-template <typename T, bool shared>
-struct task_mutex_event_awaiter : public task_event_awaiter<T> {
-    using parent = task_event_awaiter<T>;
+template <bool shared>
+struct task_mutex_event_awaiter : public task_event_awaiter {
+    using parent = task_event_awaiter;
     mutex* m_;
 
     locked_mutex_t<shared> await_resume() {
@@ -975,15 +1008,98 @@ struct task_mutex_event_awaiter : public task_event_awaiter<T> {
     }
 };
 
-template <typename T>
 template <bool shared>
-inline task_mutex_event_awaiter<T, shared> task_promise<T>::await_transform(mutex_event<shared> ev) {
-    return task_mutex_event_awaiter<T, shared>{{std::move(ev).handle(), nullptr}, ev.mutex()};
+inline task_mutex_event_awaiter<shared> task_promise_base::await_transform(mutex_event<shared> ev) {
+    return task_mutex_event_awaiter<shared>{{std::move(ev).handle(), nullptr}, ev.mutex()};
 }
 
-template <bool shared>
-inline task_mutex_event_awaiter<void, shared> task_promise<void>::await_transform(mutex_event<shared> ev) {
-    return task_mutex_event_awaiter<void, shared>{{std::move(ev).handle(), nullptr}, ev.mutex()};
+
+// task_promise_base methods
+
+inline event task_promise_base::resolution() {
+    if (!resolution_ && !resolving_) {
+        resolution_ = event_handle(new event_body);
+    }
+    return event(resolution_);
+}
+
+// prepare_awaiter - when coroutine `awaiter` calls `co_await awaitee`, we
+// call `awaitee.promise().prepare_awaiter(awaiter.promise())`
+
+inline std::coroutine_handle<> task_promise_base::prepare_awaiter(task_promise_base& awaiter) {
+    // check task compatibility: same driver, awaitee detached
+    if (home_ != awaiter.home_) {
+        throw cotamer_error(cotamer_errc::cross_driver_await);
+    } else if (detached_) {
+        throw cotamer_error(cotamer_errc::detached_await);
+    }
+    // awaiter is interested in awaitee
+    if (interest_) {
+        interest_->trigger();
+    }
+    // record awaiter in awaitee’s promise
+    awaiter_ = reinterpret_cast<uintptr_t>(&awaiter);
+    // mark resolution point forwarding
+    if (forwarded_) {
+        forwarded_ = false;
+        awaiter.forward_ = this;
+    }
+    // Awaitee can be resolving only if awaitee is blocked at a resolution
+    // point, but awaitee was subject to cotamer::forward().
+    if (resolving_) {
+        // assert(awaiter.forward_); - this assertion holds
+        if (active_awaiter()) {
+            // Awaitee is being actively awaited → clear resolution point and
+            // execute it
+            resolving_ = false;
+            resolution_ = nullptr;
+            return base_handle();
+        }
+        // Awaitee is not actively awaited → forward resolution point
+        // (for exposure via resolution())
+        awaiter.resolution_point();
+    }
+    return std::noop_coroutine();
+}
+
+inline void task_promise_base::clear_awaiter() {
+    auto aw = awaiter();
+    if (aw && aw->forward_) {
+        aw->forward_ = nullptr;
+        aw->resolving_ = false;
+        aw->resolution_ = nullptr;
+    }
+}
+
+inline void task_promise_base::resolution_point() {
+    resolving_ = true;
+    if (resolution_) {
+        resolution_->trigger();
+    }
+    if (auto aw = awaiter()) {
+        if (aw->forward_) {
+            aw->resolution_point();
+        }
+    } else if (auto eh = awaiter_event()) {
+        eh->trigger();
+    }
+}
+
+template <typename T>
+inline std::coroutine_handle<> task_final_awaiter::await_suspend(std::coroutine_handle<task_promise<T>> self) noexcept {
+    auto& p = self.promise();
+    // trigger resolution event, since the task is done
+    p.resolution_point();
+    // resume awaiter directly, unless resolve() is driving the chain
+    auto aw = p.awaiter();
+    if (aw && !p.in_resolve_) {
+        return aw->base_handle();
+    }
+    // destroy if detached and then return to event loop
+    if (p.detached_) {
+        self.destroy();
+    }
+    return std::noop_coroutine();
 }
 
 }
@@ -1002,16 +1118,25 @@ inline event::event(detail::event_handle ev)
 inline event::event(std::nullptr_t) {
 }
 
+inline bool event::triggered() const noexcept {
+    return ep_.triggered();
+}
+
 inline bool event::empty() const noexcept {
-    return !ep_ || ep_->empty();
+    return ep_.empty();
 }
 
 inline bool event::idle() const noexcept {
-    return !ep_ || ep_->idle();
+    return ep_.idle();
 }
 
-inline bool event::triggered() const noexcept {
-    return !ep_ || ep_->triggered();
+inline int event::user_flags() const noexcept {
+    return ep_ ? (ep_->relaxed_flags() & detail::efm_user) >> detail::efs_user : 0;
+}
+
+inline void event::set_user_flags(int flags) {
+    assert(ep_);
+    ep_->set_user_flags(flags << detail::efs_user);
 }
 
 inline bool event::trigger() {
@@ -1019,7 +1144,7 @@ inline bool event::trigger() {
 }
 
 inline event& event::arm() {
-    if (!ep_ || ep_->triggered()) {
+    if (ep_.triggered()) {
         std::exchange(ep_, detail::event_handle{new detail::event_body});
     }
     return *this;
@@ -1044,9 +1169,20 @@ inline detail::event_handle&& event::handle() && noexcept {
 
 // task methods
 
+namespace detail {
+inline task<> make_task(event e) {
+    co_await e;
+}
+}
+
 template <typename T>
 inline task<T>::task(handle_type handle) noexcept
     : handle_(handle) {
+}
+
+template <typename T>
+inline task<T>::task(event e) noexcept requires std::is_void_v<T>
+    : task(detail::make_task(std::move(e))) {
 }
 
 template <typename T>
@@ -1089,7 +1225,7 @@ inline bool task<T>::done() const {
 
 template <typename T>
 inline bool task<T>::resolvable() const {
-    return handle_ && (handle_.done() || handle_.promise().resolving_);
+    return handle_ && handle_.promise().resolving_;
 }
 
 template <typename T>
@@ -1102,17 +1238,7 @@ inline bool task<T>::resolve() {
 
 template <typename T>
 inline event task<T>::resolution() {
-    if (!handle_) {
-        return event();
-    }
-    auto& p = handle_.promise();
-    if (handle_.done() || p.resolving_) {
-        return event(nullptr);
-    }
-    if (!p.resolution_) {
-        p.resolution_ = detail::event_handle(new detail::event_body);
-    }
-    return event(p.resolution_);
+    return handle_ ? handle_.promise().resolution() : event();
 }
 
 template <typename T>
@@ -1140,7 +1266,7 @@ inline void task<T>::detach() {
     }
     auto& p = handle_.promise();
     p.detached_ = true;
-    if (handle_.done() || p.resolving_) {
+    if (p.resolving_) {
         handle_.destroy();
     }
     handle_ = nullptr;
@@ -1157,6 +1283,16 @@ inline void task<T>::destroy() {
 template <typename T>
 inline detail::task_awaiter<T> task<T>::operator co_await() const noexcept {
     return detail::task_awaiter<T>{handle_};
+}
+
+template <typename T>
+inline auto task<T>::promise_ptr() const noexcept -> const promise_type* {
+    return handle_ ? &handle_.promise() : nullptr;
+}
+
+template <typename T>
+inline auto task<T>::promise_ptr() noexcept -> promise_type* {
+    return handle_ ? &handle_.promise() : nullptr;
 }
 
 
@@ -1262,8 +1398,8 @@ inline void driver::after(const std::chrono::duration<Rep, Period>& d, event e) 
     at(steady_now() + std::chrono::duration_cast<duration>(d), std::move(e));
 }
 
-inline event driver::file_event(const cotamer::fd& f, fdevent type) {
-    return fds_.watch(f.fileno(), int(type), f.body(), this);
+inline event driver::file_event(const cotamer::fd& f, fdevent mask) {
+    return fds_.watch(f.fileno(), mask, f.body(), this);
 }
 
 inline void driver::loop() {
@@ -1351,6 +1487,10 @@ inline event after(const std::chrono::duration<Rep, Period>& d) {
     return driver::current->after(d);
 }
 
+inline event file_event(const fd& f, fdevent mask) {
+    return driver::current->file_event(f, mask);
+}
+
 inline event readable(const fd& f) {
     return driver::current->file_event(f, fdevent::read);
 }
@@ -1369,11 +1509,11 @@ inline event closed(const fd& f) {
 // any(), all()
 //    Multi-argument forms create a quorum_event_body. Single-argument forms
 //    pass through to make_event (no quorum needed). Zero-argument forms
-//    return an already-triggered event.
+//    return an appropriate event.
 
-template <typename E0, typename... Es>
-inline event any(E0 e0, Es&&... es) {
-    auto q = new detail::quorum_event_body(1, std::forward<E0>(e0), std::forward<Es>(es)...);
+template <typename... Es>
+inline event any(Es&&... es) {
+    auto q = detail::quorum_event_body::make(1, std::forward<Es>(es)...);
     return detail::event_handle(q);
 }
 
@@ -1383,16 +1523,14 @@ inline event any(E&& e) {
 }
 
 inline event any() {
-    // any() with no arguments returns an already-triggered event.
-    // An alternate design would treat any() as an untriggered event (like
-    // how false is the identity for logical or).
-    return event(nullptr);
+    // An untriggered event (false is the identity for logical or)
+    return event();
 }
 
 
 template <typename... Es>
 inline event all(Es&&... es) {
-    auto q = new detail::quorum_event_body(sizeof...(Es), std::forward<Es>(es)...);
+    auto q = detail::quorum_event_body::make(sizeof...(Es), std::forward<Es>(es)...);
     return detail::event_handle(q);
 }
 
@@ -1402,9 +1540,199 @@ inline event all(E&& e) {
 }
 
 inline event all() {
+    // A triggered event (true is the identity for logical and)
     return event(nullptr);
 }
 
+
+// combinator helpers
+
+namespace detail {
+namespace races {
+
+template <typename T> struct param {
+    using type = event;
+    using return_type = void;
+    using alternative_type = std::monostate;
+
+    template <typename E>
+    static event make(E&& e) {
+        return make_event(std::forward<E>(e));
+    }
+    static void resolve(event&) {
+    }
+    static std::monostate resolve_alternative(event&) {
+        return std::monostate{};
+    }
+};
+template <typename T> struct param<task<T>> {
+    using type = task<T>;
+    using return_type = T;
+    using alternative_type = task_alternative_type_t<task<T>>;
+
+    static task<T> make(task<T>&& t) {
+        t.start();
+        return std::move(t);
+    }
+    static return_type resolve(task<T>& t) {
+        return t.promise_ptr()->result();
+    }
+    static alternative_type resolve_alternative(task<T>& t) {
+        if constexpr (std::is_void_v<return_type>) {
+            t.promise_ptr()->result();
+            return std::monostate{};
+        } else {
+            return t.promise_ptr()->result();
+        }
+    }
+};
+template <typename T> struct param<task<T>&> : param<task<T>> {
+    using type = task<T>&;
+
+    static task<T>& make(task<T>& t) {
+        t.start();
+        return t;
+    }
+};
+template <typename T> struct param<task<T>&&> : param<task<T>> { };
+
+
+struct make_quorum_s {
+    template <typename... Ts>
+    event operator()(Ts&... ts) {
+        quorum_event_body* qeb = new quorum_event_body(1);
+        uint32_t qf = quorum_event_body::ef_initial;
+        ((add(qeb, qf, ts)), ...);
+        qeb->seal(qf);
+        return event_handle(qeb);
+    }
+    template <typename T>
+    void add(quorum_event_body* qeb, uint32_t& qf, T& t) {
+        if constexpr (is_task_v<T>) {
+            if (auto p = t.promise_ptr()) {
+                p->awaiter_ = reinterpret_cast<uintptr_t>(qeb) | 1;
+            }
+        } else {
+            qf = qeb->add_member(qf, t);
+        }
+    }
+};
+
+struct find_resolved_s {
+    template <typename... Ts>
+    size_t operator()(Ts&... ts) {
+        size_t n = 0;
+        ((is_resolved(ts) || (++n, false)) || ...);
+        return n;
+    }
+    template <typename T>
+    bool is_resolved(T& t) {
+        if constexpr (is_task_v<T>) {
+            return t.resolve();
+        } else {
+            return t.triggered();
+        }
+    }
+};
+
+struct select_value_s {
+    size_t index;
+
+    template <typename... Ts>
+    auto operator()(Ts&... ts) -> common_task_value_type_t<Ts...> {
+        using V = common_task_value_type_t<Ts...>;
+        return select<V>(0, ts...);
+    }
+    template <typename V, typename T>
+    V select(size_t, T& t) {
+        return races::param<T>::resolve(t);
+    }
+    template <typename V, typename T, typename... Ts>
+    V select(size_t i, T& t, Ts&... ts) {
+        return i == index ? races::param<T>::resolve(t) : select<V>(i + 1, ts...);
+    }
+};
+
+template <typename Variant>
+struct select_variant_s {
+    size_t index;
+
+    template <typename... Ts>
+    Variant operator()(Ts&... ts) {
+        return select<0>(ts...);
+    }
+    template <size_t I, typename T>
+    Variant select(T& t) {
+        return Variant{std::in_place_index<I>, races::param<T>::resolve_alternative(t)};
+    }
+    template <size_t I, typename T, typename... Ts>
+    Variant select(T& t, Ts&... ts) {
+        if (I == index) {
+            return Variant{std::in_place_index<I>, races::param<T>::resolve_alternative(t)};
+        }
+        return select<I + 1>(ts...);
+    }
+};
+
+struct clear_awaiter_s {
+    template <typename... Ts>
+    void operator()(Ts&... ts) {
+        ((clear(ts)), ...);
+    }
+    template <typename T>
+    void clear(T& t) {
+        if constexpr (is_task_v<T>) {
+            if (auto p = t.promise_ptr()) {
+                p->awaiter_ = 0;
+            }
+        }
+    }
+};
+
+}
+
+template <typename... Ts>
+struct race_params {
+    using first_type = typename std::tuple_element<0, std::tuple<Ts...>>::type;
+    std::tuple<Ts...> args;
+    bool awaited = false;
+
+    template <typename... Us>
+    race_params(Us&&... us)
+        : args(races::param<Us&&>::make(std::forward<Us>(us))...) {
+    }
+    ~race_params() {
+        if (awaited) {
+            std::apply(races::clear_awaiter_s{}, args);
+        }
+    }
+    size_t find_resolved() {
+        return std::apply(races::find_resolved_s{}, args);
+    }
+    task_alternative_type_t<first_type> select_first() {
+        return races::param<first_type>::resolve_alternative(std::get<0>(args));
+    }
+    auto select_value(size_t index) requires requires { typename common_task_value_type<Ts...>::type; } {
+        return std::apply(races::select_value_s{index}, args);
+    }
+    std::variant<task_alternative_type_t<Ts>...> select_variant(size_t index) {
+        using Variant = std::variant<task_alternative_type_t<Ts>...>;
+        return std::apply(races::select_variant_s<Variant>{index}, args);
+    }
+    event make_event() {
+        awaited = true;
+        return std::apply(races::make_quorum_s{}, args);
+    }
+    void after_event() {
+        std::apply(races::clear_awaiter_s{}, args);
+        awaited = false;
+    }
+};
+
+template <typename... Ts>
+using race_params_t = race_params<typename races::param<Ts>::type...>;
+
+}
 
 // attempt(t, e...)
 //    Runs a `task<T>` (the first argument) with cancellation (the other
@@ -1412,47 +1740,19 @@ inline event all() {
 //    task was cancelled.
 
 template <typename T, typename... Es>
-task<std::optional<T>> attempt(task<T> t, Es... es) {
-    while (!t.resolve()) {
-        t.start();
-        co_await any(t.resolution(), es...);
-        if (!t.resolvable()) {
-            // `t` is a parameter, so its destructor will not run immediately
-            // upon co_return (it is destroyed with the coroutine state). But
-            // we want to destroy it now, because no one cares about its
-            // result.
-            t.destroy();
+task<std::optional<task_attempt_type_t<T>>> attempt(T&& t, Es&&... es) {
+    detail::race_params_t<T, Es...> ax(std::forward<T>(t), std::forward<Es>(es)...);
+    while (true) {
+        co_await resolve{};
+        size_t ridx = ax.find_resolved();
+        if (ridx == 0) {
+            co_return ax.select_first();
+        } else if (ridx != 1 + sizeof...(es)) {
             co_return std::nullopt;
         }
+        co_await ax.make_event();
+        ax.after_event();
     }
-    co_return co_await t;
-}
-
-template <typename T, typename... Es>
-task<std::optional<T>> attempt(task<std::optional<T>> t, Es... es) {
-    while (!t.resolve()) {
-        t.start();
-        co_await any(t.resolution(), es...);
-        if (!t.resolvable()) {
-            t.destroy();
-            co_return std::nullopt;
-        }
-    }
-    co_return co_await t;
-}
-
-template <typename... Es>
-task<std::optional<std::monostate>> attempt(task<void> t, Es... es) {
-    while (!t.resolve()) {
-        t.start();
-        co_await any(t.resolution(), es...);
-        if (!t.resolvable()) {
-            t.destroy();
-            co_return std::nullopt;
-        }
-    }
-    co_await t;
-    co_return std::monostate{};
 }
 
 template <bool shared, typename... Es>
@@ -1471,166 +1771,60 @@ task<std::optional<locked_mutex_t<shared>>> attempt(mutex_event<shared> e, Es&&.
 //    Runs several tasks in parallel, and returns the result of the first
 //    to complete, cancelling the others. Returns `std::variant<T...>`.
 
-namespace detail {
-
-// Forward declarations for mixed task/event recursion.
-template <typename... Trest>
-inline size_t find_resolved(size_t offset, event&& e0, Trest&&... trest);
-template <typename Variant, size_t I, typename... Trest>
-inline task<Variant> complete_first(size_t index, event&, Trest&... trest);
-template <size_t I, typename... Trest>
-inline task<> complete_race(size_t index, event&, Trest&... trest);
-
-inline size_t find_resolved(size_t offset) {
-    return offset;
-}
-
-template <typename T, typename... Trest>
-inline size_t find_resolved(size_t offset, task<T>&& t0, Trest&&... trest) {
-    if (t0.resolve()) {
-        return offset;
-    }
-    return find_resolved(offset + 1, std::forward<Trest>(trest)...);
-}
-
-template <typename... Trest>
-inline size_t find_resolved(size_t offset, event&& e0, Trest&&... trest) {
-    if (e0.triggered()) {
-        return offset;
-    }
-    return find_resolved(offset + 1, std::forward<Trest>(trest)...);
-}
-
-template <typename T>
-inline void destroy_task(task<T>& t) { t.destroy(); }
-inline void destroy_task(event&) { }
-
-template <typename T>
-inline void start_task(task<T>& t) { t.start(); }
-inline void start_task(event&) { }
-
-template <typename T>
-inline event make_resolution(task<T>& t) { return t.resolution(); }
-inline event make_resolution(event& e) { return e; }
-
-template <typename Variant, size_t I, typename T>
-inline task<Variant> complete_first(size_t, task<T>& t0) {
-    if constexpr (std::is_void_v<T>) {
-        co_await t0;
-        co_return Variant{std::in_place_index<I>, std::monostate{}};
-    } else {
-        co_return Variant{std::in_place_index<I>, co_await t0};
-    }
-}
-
-template <typename Variant, size_t I>
-inline task<Variant> complete_first(size_t, event&) {
-    co_return Variant{std::in_place_index<I>, std::monostate{}};
-}
-
-template <typename Variant, size_t I, typename T, typename... Trest>
-inline task<Variant> complete_first(size_t index, task<T>& t0, Trest&... trest) {
-    if (index == I) {
-        ((destroy_task(trest)), ...);
-        if constexpr (std::is_void_v<T>) {
-            co_await t0;
-            co_return Variant{std::in_place_index<I>, std::monostate{}};
-        } else {
-            co_return Variant{std::in_place_index<I>, co_await t0};
-        }
-    } else {
-        t0.destroy();
-        co_return co_await complete_first<Variant, I+1>(index, std::forward<Trest&>(trest)...);
-    }
-}
-
-template <typename Variant, size_t I, typename... Trest>
-inline task<Variant> complete_first(size_t index, event&, Trest&... trest) {
-    if (index == I) {
-        ((destroy_task(trest)), ...);
-        co_return Variant{std::in_place_index<I>, std::monostate{}};
-    } else {
-        co_return co_await complete_first<Variant, I+1>(index, std::forward<Trest&>(trest)...);
-    }
-}
-
-template <size_t I, typename T>
-inline task<T> complete_race(size_t, task<T>& t0) {
-    co_return co_await t0;
-}
-
-template <size_t I>
-inline task<> complete_race(size_t, event&) {
-    co_return;
-}
-
-template <size_t I, typename T, typename... Trest>
-inline task<T> complete_race(size_t index, task<T>& t0, Trest&... trest) {
-    if (index == I) {
-        ((destroy_task(trest)), ...);
-        co_return co_await t0;
-    } else {
-        t0.destroy();
-        co_return co_await complete_race<I+1>(index, std::forward<Trest&>(trest)...);
-    }
-}
-
-template <size_t I, typename... Trest>
-inline task<> complete_race(size_t index, event&, Trest&... trest) {
-    if (index == I) {
-        ((destroy_task(trest)), ...);
-        co_return;
-    } else {
-        co_return co_await complete_race<I+1>(index, std::forward<Trest&>(trest)...);
-    }
-}
-
-}
-
 inline task<> first() {
     return task<>();
 }
 
 template <typename... Ts>
-task<std::variant<task_return_type_t<Ts>...>> first(Ts... ts) {
-    using Variant = std::variant<task_return_type_t<Ts>...>;
+task<std::variant<task_alternative_type_t<Ts>...>> first(Ts&&... ts) {
+    detail::race_params_t<Ts...> ax(std::forward<Ts>(ts)...);
     while (true) {
-        size_t ridx = detail::find_resolved(0, std::forward<Ts>(ts)...);
+        co_await resolve{};
+        size_t ridx = ax.find_resolved();
         if (ridx != sizeof...(ts)) {
-            co_return co_await detail::complete_first<Variant, 0>(ridx, std::forward<Ts&>(ts)...);
+            co_return ax.select_variant(ridx);
         }
-        ((detail::start_task(ts)), ...);
-        co_await any(detail::make_resolution(ts)...);
+        co_await ax.make_event();
+        ax.after_event();
     }
 }
 
-inline task<> race() {
-    return task<>();
+template <typename T>
+inline task<T> race() {
+    co_await event(); // never resumes
+    throw cotamer_error(cotamer_errc::unreachable);
 }
 
-template <typename T, typename... Trest>
-task<T> race(task<T> t0, Trest... ts) {
+template <typename T>
+inline task<T> race(task<T>&& t) {
+    return std::move(t);
+}
+
+template <typename T>
+inline task<T>& race(task<T>& t) {
+    return t;
+}
+
+template <typename... Ts>
+task<common_task_value_type_t<Ts...>> race(Ts&&... ts) {
+    detail::race_params_t<Ts...> ax(std::forward<Ts>(ts)...);
     while (true) {
-        size_t ridx = detail::find_resolved(0, std::forward<task<T>>(t0), std::forward<Trest>(ts)...);
-        if (ridx != 1 + sizeof...(ts)) {
-            co_return co_await detail::complete_race<0>(ridx, t0, std::forward<Trest&>(ts)...);
+        co_await resolve{};
+        size_t ridx = ax.find_resolved();
+        if (ridx != sizeof...(ts)) {
+            co_return ax.select_value(ridx);
         }
-        t0.start();
-        ((detail::start_task(ts)), ...);
-        co_await any(t0.resolution(), detail::make_resolution(ts)...);
+        co_await ax.make_event();
+        ax.after_event();
     }
 }
 
-template <typename... Trest>
-task<> race(event e0, Trest... ts) {
-    while (true) {
-        size_t ridx = detail::find_resolved(0, std::forward<event>(e0), std::forward<Trest>(ts)...);
-        if (ridx != 1 + sizeof...(ts)) {
-            co_return co_await detail::complete_race<0>(ridx, e0, std::forward<Trest&>(ts)...);
-        }
-        ((detail::start_task(ts)), ...);
-        co_await any(e0, detail::make_resolution(ts)...);
+template <typename T>
+task<T> forward(task<T> t) {
+    if (!t.done()) {
+        t.handle_.promise().forwarded_ = true;
     }
+    return t;
 }
 
 
@@ -1667,96 +1861,96 @@ inline size_t driver::timer_size() const noexcept {
     return timed_.size();
 }
 
+inline unsigned driver::nfdctl() const noexcept {
+    return nfdctl_;
+}
+
+inline const detail::fd_event_set& driver::fds() const noexcept {
+    return fds_;
+}
+
 
 // file descriptor functions
 
 namespace detail {
 
-inline event_handle fd_event_set::watch(int fd, int interest, fd_body* body,
-                                        driver* drv) {
-    if (fd < 0) {
-        return event_handle();
-    }
+inline unsigned fd_event_set::take_watch_list(int fd, fdevent imask, unsigned epoch) {
     unsigned ufd = fd;
-    if (ufd >= capacity_) {
-        hard_ensure(ufd);
+    if (ufd >= fdr_capacity_) {
+        return 0U;
     }
     fdrec& fdi = fdrs_[ufd];
-    if (fdi.body != body) {
-        if (fdi.body) {
-            for (int ix = 0; ix != 3; ++ix) {
-                if (fdi.ev[ix]) {
-                    fdi.ev[ix]->trigger();
-                    fdi.ev[ix] = nullptr;
-                }
-            }
-            fdi.body->remove_listener(drv);
+    if (!fdi.whead || (epoch && epoch != fdi.epoch)) {
+        return 0U;
+    }
+    // Walk `watchrec` chain in order. Watches intersecting with `imask` are
+    // detached, appended to `whead`, and eventually returned; others are
+    // preserved.
+    unsigned whead = 0U;
+    unsigned* wpprev = &whead;
+    unsigned wix = fdi.whead;
+    unsigned* fdpprev = &fdi.whead;
+    fdi.wtail = 0U;
+    while (wix) {
+        auto& wr = ws_[wix - 1];
+        unsigned next = wr.wlink;
+        if ((imask & wr.mask) != fdevent::none || wr.ev->empty()) {
+            *wpprev = wix;
+            wpprev = &wr.wlink;
+        } else {
+            *fdpprev = fdi.wtail = wix;
+            fdpprev = &wr.wlink;
         }
-        fdi.body = body;
-        body->add_listener(drv);
+        wix = next;
     }
-    if (!fdi.ev[interest]) {
-        if (fdi.update_link_ == update_clean) {
-            fdi.update_link_ = update_link_;
-            update_link_ = ufd + 1;
-        }
-        fdi.ev[interest] = event_handle{new event_body};
-    }
-    return fdi.ev[interest];
-}
-
-inline event_handle fd_event_set::take(int fd, int interest, unsigned epoch) {
-    unsigned ufd = fd;
-    if (ufd >= capacity_) {
-        return event_handle();
-    }
-    fdrec& fdi = fdrs_[ufd];
-    if (!fdi.ev[interest]
-        || fdi.ev[interest]->empty()
-        || (epoch && epoch != fdi.epoch)) {
-        return event_handle();
-    }
-    if (fdi.update_link_ == update_clean) {
-        fdi.update_link_ = update_link_;
+    *wpprev = *fdpprev = 0U;   // null-terminate both chains
+    // If we changed the watchrec chain, queue to update kernel notifier
+    if (whead && fdi.update_link == link_clean) {
+        fdi.update_link = update_link_;
         update_link_ = ufd + 1;
     }
-    return std::exchange(fdi.ev[interest], nullptr);
+    return whead;
 }
 
-inline std::optional<std::pair<fd_body*, unsigned>> fd_event_set::check_fd_close(int fd) {
-    unsigned ufd = fd;
-    if (ufd >= capacity_) {
-        return std::nullopt;
+inline event_handle fd_event_set::pop_watch_list_event(unsigned& wix, fdevent mask) {
+    unsigned in_wix = wix;
+    watchrec& wr = ws_[wix - 1];
+    wix = wr.wlink;
+    wr.wlink = free_wlink_;
+    free_wlink_ = in_wix;
+    if (wr.ev && mask != fdevent::none) {
+        wr.ev->set_user_flags(int(mask) << efs_user);
     }
-    fdrec& fdi = fdrs_[ufd];
-    if (!fdi.body || fdi.body->fileno() >= 0) {
-        return std::nullopt;
-    }
-    for (int ix = 0; ix != 3; ++ix) {
-        if (fdi.ev[ix]) {
-            fdi.ev[ix]->trigger();
-            fdi.ev[ix] = nullptr;
-        }
-    }
-    ++fdi.epoch;
-    return {{std::exchange(fdi.body, nullptr), fdi.epoch - 1}};
+    return std::exchange(wr.ev, nullptr);
 }
 
 inline bool fd_event_set::has_update() const noexcept {
-    return update_link_ != update_sentinel;
+    return update_link_ != link_sentinel;
+}
+
+inline fdevent fd_event_set::watch_list_mask(unsigned wix) const {
+    fdevent mask = fdevent::none;
+    while (wix) {
+        auto& wr = ws_[wix - 1];
+        if (!wr.ev.empty()) {
+            mask = mask | wr.mask;
+        }
+        wix = wr.wlink;
+    }
+    return mask;
 }
 
 inline std::optional<fd_update> fd_event_set::pop_update() noexcept {
-    if (update_link_ == update_sentinel) {
+    if (update_link_ == link_sentinel) {
         return std::nullopt;
     }
     unsigned ufd = update_link_ - 1;
     fdrec& fdi = fdrs_[ufd];
-    update_link_ = fdi.update_link_;
-    fdi.update_link_ = update_clean;
-    auto mask = fdi.mask();
+    update_link_ = fdi.update_link;
+    fdi.update_link = link_clean;
+    auto mask = watch_list_mask(fdi.whead);
     unsigned epoch = fdi.epoch;
-    if (!mask) {
+    if (mask == fdevent::none) {
         ++fdi.epoch;
     } else if (epoch < user_epoch) { // epoch 1 is reserved for internal FDs
         fdi.epoch = epoch = user_epoch;
@@ -1764,21 +1958,37 @@ inline std::optional<fd_update> fd_event_set::pop_update() noexcept {
     return {{int(ufd), mask, epoch}};
 }
 
-inline std::optional<fd_update> fd_event_set::next_nonempty(int fd) const noexcept {
+inline std::optional<fd_update> fd_event_set::next_known(int fd) const noexcept {
     unsigned ufd = fd + 1;
-    if (ufd >= capacity_) {
+    if (ufd >= fdr_capacity_) {
         return std::nullopt;
     }
     const fdrec* fdrp = fdrs_ + ufd;
     while (true) {
-        if (int mask = fdrp->mask()) {
-            return {{int(ufd), mask, fdrp->epoch}};
+        if (fdrp->known()) {
+            return {{int(ufd), watch_list_mask(fdrp->whead), fdrp->epoch}};
         }
-        if (++ufd == capacity_) {
+        if (++ufd == fdr_capacity_) {
             return std::nullopt;
         }
         ++fdrp;
     }
+}
+
+inline size_t fd_event_set::active_watch_count() const noexcept {
+    size_t n = ws_.size();
+    for (unsigned wix = free_wlink_; wix; wix = ws_[wix - 1].wlink) {
+        --n;
+    }
+    return n;
+}
+
+inline fdevent fd_event_set::fd_mask(int fd) const noexcept {
+    unsigned ufd = fd;
+    if (ufd >= fdr_capacity_) {
+        return fdevent::none;
+    }
+    return watch_list_mask(fdrs_[ufd].whead);
 }
 
 }
@@ -1844,7 +2054,7 @@ inline fd::operator bool() const noexcept {
 
 inline void fd::close() {
     if (body_) {
-        body_->deref_close(false);
+        body_->close(false);
     }
 }
 
@@ -1879,7 +2089,13 @@ inline detail::event_handle&& mutex_event<shared>::handle() && noexcept {
 
 inline mutex_event<false> mutex::lock() {
     mutex_event<false> me(this);
-    lock_impl(false, me.ep_);
+    lock_impl(false, me.ep_, nullptr);
+    return me;
+}
+
+inline mutex_event<false> mutex::lock(bool& notify) {
+    mutex_event<false> me(this);
+    lock_impl(false, me.ep_, &notify);
     return me;
 }
 
@@ -1900,7 +2116,13 @@ inline void mutex::unlock() {
 
 inline mutex_event<true> mutex::lock_shared() {
     mutex_event<true> me(this);
-    lock_impl(true, me.ep_);
+    lock_impl(true, me.ep_, nullptr);
+    return me;
+}
+
+inline mutex_event<true> mutex::lock_shared(bool& notify) {
+    mutex_event<true> me(this);
+    lock_impl(true, me.ep_, &notify);
     return me;
 }
 
@@ -1941,7 +2163,7 @@ inline auto mutex::latch() -> latch_type {
 
 inline void mutex::unlatch(latch_type l) {
     if (!waiters_.empty()) {
-        l += waiter_shared(waiters_.front()) ? mf_next_shared : mf_next_excl;
+        l += waiter_shared(waiters_.front().first) ? mf_next_shared : mf_next_excl;
     }
     latch_.store(l, std::memory_order_release);
 }
@@ -1989,14 +2211,13 @@ inline void unique_lock::swap(unique_lock& x) noexcept {
     }
 }
 
-inline task<> unique_lock::lock() {
+inline mutex_event<false> unique_lock::lock() {
     if (!m_) {
         throw std::system_error(std::make_error_code(std::errc::operation_not_permitted));
     } else if (owned_) {
         throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur));
     }
-    co_await m_->lock();
-    owned_ = true;
+    return m_->lock(owned_);
 }
 
 inline bool unique_lock::try_lock() {
@@ -2065,14 +2286,13 @@ inline void shared_lock::swap(shared_lock& x) noexcept {
     }
 }
 
-inline task<> shared_lock::lock() {
+inline mutex_event<true> shared_lock::lock() {
     if (!m_) {
         throw std::system_error(std::make_error_code(std::errc::operation_not_permitted));
     } else if (owned_) {
         throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur));
     }
-    co_await m_->lock_shared();
-    owned_ = true;
+    return m_->lock_shared(owned_);
 }
 
 inline bool shared_lock::try_lock() {
@@ -2099,14 +2319,53 @@ inline auto shared_lock::release() noexcept -> mutex_type* {
 }
 
 namespace detail {
-template <typename T>
-inline task_mutex_event_awaiter<T, false> task_promise<T>::await_transform(mutex& m) {
+inline task_mutex_event_awaiter<false> task_promise_base::await_transform(mutex& m) {
     return await_transform(m.lock());
+}
 }
 
-inline task_mutex_event_awaiter<void, false> task_promise<void>::await_transform(mutex& m) {
-    return await_transform(m.lock());
+
+// Statistics
+
+inline detail::describe_task_awaiter describe(const std::string& description) {
+    return detail::describe_task_awaiter{description};
 }
+
+
+// String helpers
+
+namespace strings {
+
+inline bool ieq(const char* a, const char* b, size_t count) noexcept {
+    for (; count != 0; ++a, ++b, --count) {
+        char ach = *a, bch = *b;
+        if (ach >= 'A' && ach <= 'Z') {
+            ach += 32; // make lower case
+        }
+        if (bch >= 'A' && bch <= 'Z') {
+            bch += 32;
+        }
+        if (ach != bch) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool ieq(std::string_view a, std::string_view b) noexcept {
+    return a.size() == b.size() && ieq(a.data(), b.data(), a.size());
+}
+
+}
+
+
+// JSON helpers
+
+namespace detail {
+template <typename T>
+concept nlohmann_basic_json_type = requires {
+    typename T::template json_serializer<int>;
+};
 }
 
 }
