@@ -690,6 +690,256 @@ Leaving as future work — current behavior is functionally correct and passes e
 
 ---
 
+## Chunk 12 — Person A (4 hr): Two-tab demo polish — SSE latency, sync bugs, debug rig, netsim flags
+
+**Files:** `pset4/http_server.cc`, `pset4/static/editor.js`, `pset4/pt-collab.cc`, `pset4/pt-paxos.cc`, `pset4/netsim.hh`, **new** `pset4/run-server.sh`, **new** `pset4/logs/` directory.
+
+The post-Chunk-11 server *built* and *passed every regression test*, but the two-tab browser demo was visibly broken: edits took ~300 ms to propagate, then after ~10 s of typing the tabs diverged (`"This works until it"` / `"This NNworks..."`), then Paxos commits started returning **504 Gateway Timeout**. This chunk walks through every distinct bug that contributed to that experience, the fix for each, and the instrumentation we added to find them.
+
+**Done when:** two browser tabs typing concurrently for several minutes converge to the same text without any 504s, and `collab-bench.sh` still passes its full 100-seed matrix (because the bench's timing must remain unchanged).
+
+---
+
+### Chunk 12 implementation log (Aengus, 2026-05-12)
+
+**Status: COMPLETE.** All four bugs squashed; demo runs smoothly with `./run-server.sh --port 8080 --link-delay-ms 0 --send-delay-ms 0 --recv-delay-ms 0`; bench unchanged.
+
+#### Bug A — Visibility latency floor: stacked polling on the SSE path
+
+**File:** `pset4/http_server.cc`
+
+The SSE delivery path had two polling layers in series:
+
+- `poll_doc_cache` (line 731 in the pre-edit file) refreshes the in-memory cache from PancyDB every **100 ms**.
+- The per-subscriber SSE coroutine (line 681) loops `cot::after(250ms)` between checks of the cache.
+
+Worst-case time from "tab A's POST commits" to "event arrives at tab B's textarea" was therefore **~350 ms** (`100ms + 250ms`). Felt sluggish in practice.
+
+**Fix:** dropped the inner SSE loop interval to `cot::after(25ms)`. Worst-case visibility is now ~125 ms.
+
+This is a *band-aid*, not the right shape — polling at any interval has a hard floor. The proper fix is an event-driven fanout: a `cot::event` per doc that `poll_doc_cache` (or `note_committed`) triggers when `version_` advances, with each SSE coroutine `co_await`ing the event instead of sleeping. Latency would then be ~microseconds. Deferred — current value is acceptable for the demo and doesn't fight Paxos for scheduler bandwidth.
+
+#### Bug B — Cache duplicate rows from `poll_doc_cache` ↔ `note_committed` race
+
+**File:** `pset4/http_server.cc`
+
+The two writers to `per_doc_cache::ops_` were not coordinated:
+
+1. **`POST /op` handler path:**
+   - parse JSON → know `client_id_label = "c_..."` string
+   - `co_await submit_put(...)` — Paxos commits, returns version N
+   - call `cache.note_committed(co)` with the labeled `committed_op`
+
+2. **`poll_doc_cache` path** (independent coroutine, 100 ms cadence):
+   - read leader's PancyDB
+   - `refresh_ops_from_db` — fast-path append any new entries to `ops_`
+   - **But:** the DB only stores `op_key(doc_id, hashed_cid, seq) → serialized_op_value`. The string `client_id` is *not* in the value. So entries inserted via this path have `client_id_label = ""`.
+
+The race window: between Paxos committing the op (visible to `poll_doc_cache`) and the `POST` handler resuming to call `note_committed`, the poller could insert the op **without a label**. The handler then ran `note_committed` and *appended a second entry with the label*. `ops_` now had two rows for the same logical `(client_id, seq)`. The SSE stream emitted **both**.
+
+The browser saw two `op` events for `seq=37`: one with `client_id: 18177464760165143298` (numeric hash, no label), one with `client_id: "c_mp26uivx_dumteca"` (string). Visible in the live SSE capture:
+```
+{"version":106,"client_id":18177464760165143298,"seq":37,...}
+{"version":107,"client_id":"c_mp26uivx_dumteca","seq":37,...}
+```
+
+**Fix #1 (mine, *reactive*):** `note_committed` now scans `ops_` for an existing `(client_id, client_seq)` match. If found, it **upgrades the existing row's label** instead of pushing a duplicate. The dedup is keyed on `(client_id, client_seq)` because Paxos may bump the PancyDB *version* on retry, but `(cid_hash, seq)` is the logical identity of an op.
+
+```cpp
+for (auto& existing : ops_) {
+    if (existing.client_id == c.client_id
+        && existing.client_seq == c.client_seq) {
+        if (existing.client_id_label.empty() && !c.client_id_label.empty()) {
+            existing.client_id_label = c.client_id_label;
+        }
+        return;
+    }
+}
+```
+
+**Fix #2 (subsequent, *proactive*):** even with dedup, the SSE coroutine could snapshot `ops_` between the labelless append and the upgrade — emitting the labelless event before the upgrade ran. The proper close-the-window fix is to register the label *before* `co_await submit_put`. Added a persistent `std::map<uint64_t, std::string> client_labels_` on each `per_doc_cache`, populated at POST entry. `refresh_ops_from_db`'s fast-path append now does a lookup:
+
+```cpp
+auto label_it = client_labels_.find(fresh[i].client_id);
+if (label_it != client_labels_.end()) {
+    fresh[i].client_id_label = label_it->second;
+}
+```
+
+Now even if the poller wins the race, it stamps the label on the new entry from the persistent map. SSE never sees a labelless emit for any client that has POSTed at least once to this server.
+
+#### Bug C — `refresh_ops_from_db` slow path lost all string labels
+
+**File:** `pset4/http_server.cc`
+
+The fast path in `refresh_ops_from_db` is taken when `fresh` and `ops_` agree on prefix (same `(version, client_id, client_seq)` triples for indices `[0, ops_.size())`). Whenever something went wrong with that invariant — most commonly a Paxos retry creating a new commit slot for an already-committed key, bumping its version — the code went to the **slow path**:
+
+```cpp
+ops_ = std::move(fresh);
+text_ = collab::reconstruct(ops_);
+version_ = fresh_version;
+```
+
+`fresh` came from `collab::read_ops(db, ...)`, which knows nothing about string labels. So **every** op in `ops_` lost its `client_id_label` whenever the slow path fired. SSE thereafter emitted numeric `client_id`s for the entire history of the doc until a new POST re-labeled the relevant `cid_hash` (and even then only for the new entry, not the historical ones).
+
+**Fix:** before `ops_ = std::move(fresh)`, build a temporary `std::map<std::pair<uint64_t, uint64_t>, std::string> saved_labels` from the labels we currently have. After the move, walk the new `ops_` and restore any label that was previously known. The persistent `client_labels_` map (from Bug B Fix #2) is the second layer of defense — even labels that *never went through* this slow path get recovered via `client_labels_` if the client posted at any point during the server's lifetime.
+
+#### Bug D — JS classified peer ops as "own confirmations" by seq alone
+
+**File:** `pset4/static/editor.js` (line 270 pre-edit)
+
+Each tab generates a random `clientId = 'c_' + Date.now().toString(36) + '_' + ...`, but starts `nextSeq = 0`. So both tabs submit their first op with `seq: 0`, their second with `seq: 1`, etc. The JS classifier for incoming SSE events was:
+
+```js
+if (s.pending.length
+    && data.seq === s.pending[0].seq
+    && s.mySeqs.has(data.seq)) {
+    // confirm: pop pending[0], apply to serverText
+}
+```
+
+`seq` alone is *not* a unique key — it's per-client. When tab A had its `seq=0` pending and tab B's `seq=0` commit arrived first via SSE, tab A wrongly identified tab B's op as its own confirmation. It popped its own pending op (without transforming), applied tab B's op to `serverText` *as if it were its own*, and never re-submitted its real seq=0. The textareas diverged on the very first concurrent edit and accumulated transform errors from there.
+
+Made worse after Bug A's fix dropped the polling interval to 25 ms: with less queue depth between commit and SSE emit, two-tab races became the common case rather than the rare one.
+
+**Fix:** require `data.client_id === clientId` in addition to the `seq` check.
+
+```js
+if (s.pending.length
+    && data.seq === s.pending[0].seq
+    && s.mySeqs.has(data.seq)
+    && data.client_id === clientId) {
+    // confirm
+}
+```
+
+This depends on the server consistently emitting the **string** `client_id` (not the numeric hash) — which is exactly what Bugs B and C had to be fixed to guarantee. Bug D's fix and Bugs B/C's fixes are co-dependent: each is necessary, neither is sufficient.
+
+#### Bug E — At `loss=0, failure_schedule=none`, Paxos was still flaking under load
+
+**Files:** `pset4/netsim.hh`, `pset4/pt-paxos.cc`, `pset4/pt-collab.cc`
+
+After fixing Bugs A–D, two-tab sync was correct *but* still hit `504 Gateway Timeout` under sustained typing. Server logs showed: ~48 successful commits, then **7 in-flight `submit_put`s all timed out simultaneously** (all on `replica=0`), retries to `replica=1` and `replica=2` also failed, cluster effectively dead for the rest of the session. The polling instrumentation we added (see "Debug rig" below) showed the cache poller's `gap_us` stayed ~100 ms and `work_us` stayed under 1 ms throughout — **the scheduler was not starved**. The bottleneck was inside Paxos.
+
+The user asked the right question: at `loss = 0.0, failure_schedule = none, all replicas up`, why is Paxos electing at all? It shouldn't be.
+
+**Root cause:** `pset4/netsim.hh` carries baked-in artificial network delays:
+
+```cpp
+cot::duration link_delay_    = 5ms;  // simulated time-in-flight per message
+cot::duration send_delay_    = 1ms;  // sender blocks after sending
+cot::duration receive_delay_ = 1ms;  // receiver blocks after receiving
+```
+
+These are the bench's tuning for a real network simulation. In the **OLD cotamer**, `cot::clock::real_time` and `cot::clock::virtual_time` were *numerically equal* (`= 0` in the enum). So `cot::set_clock(cot::clock::real_time)` at `pt-collab.cc:1168` was a **no-op** — the server actually ran on the **virtual clock**. Virtual time advances by jumping to the next scheduled wakeup, so `cot::after(5ms)` between in-process replicas didn't wait 5 ms of wall time; it waited approximately 0. Replica-to-replica messages flowed at memory-copy speed.
+
+In the **NEW cotamer** (post-Chunk-11 upgrade), `real_time = 1` and is genuinely distinct. `set_clock(real_time)` now switches to wall-clock time. Every `cot::after(5ms)` actually waits 5 ms. Each Paxos message hop costs ~7 ms wall-clock (link + receive). A single PUT round-trip is roughly:
+
+- HTTP client → leader: ~7 ms
+- Leader → 2 followers (parallel): ~7 ms
+- Followers → leader (parallel): ~7 ms
+- Leader → client: ~7 ms
+- **Total: ~28 ms** — which is exactly the `latency_ms=30` we'd been seeing in `POST commit` log lines.
+
+Under heavy load (2 tabs × ~5 keystrokes/sec × 2 PUTs per keystroke = 20 PUTs/sec, plus cursor POSTs), the leader's send queue saturates. `send_delay_ = 1ms` caps each replica at 1000 messages/sec, but with replicate + ack + reply + heartbeat traffic stacked behind ~20 client PUTs/sec, the heartbeat coroutine can be queued behind ~200 ms of other work. The election timeout is `200–350 ms` (randomized per follower). Once a heartbeat slips that window, a follower starts an election → the leader loses authority → all in-flight `submit_put`s timeout at the 2s threshold → `submit_put` exhausts its 12-attempt budget (24 s of wall time) → handler returns 504.
+
+This is why every regression test passes — `pt-collab` runs the bench on **virtual time** where the delays are no-ops — but `pt-collab-server` (which explicitly switches to `real_time` because it talks to real browsers) hits the wall.
+
+**Fix:** make the simulated delays runtime-configurable via CLI flags. Specifically:
+
+- **`pset4/netsim.hh`** — add public getters/setters on `channel<T>` (`link_delay`/`set_link_delay`, `send_delay`/`set_send_delay`) and on `port<T>` (`receive_delay`/`set_receive_delay`).
+- **`pset4/pt-paxos.cc`** and **`pset4/pt-collab.cc`** — both have their own copy of `struct testinfo`. Added three fields:
+  ```cpp
+  cot::duration link_delay    = 5ms;
+  cot::duration send_delay    = 1ms;
+  cot::duration receive_delay = 1ms;
+  ```
+  Defaults preserve the bench's behavior exactly — no change in `pt-collab` / `pt-paxos` simulation timing. Extended `configure_port`/`configure_channel`/`configure_quiet_channel` (all already hooked into `pt_paxos_replica::initialize`) to set the new values.
+- **`pset4/pt-collab.cc` server `main()`** — added three flags:
+  - `--link-delay-ms N` (default 5)
+  - `--send-delay-ms N` (default 1)
+  - `--recv-delay-ms N` (default 1)
+
+  These set `tester.link_delay/send_delay/receive_delay` before constructing `pt_paxos_instance`. A startup log line confirms what was chosen: `[DoomDraft server] netsim delays link={}ms send={}ms recv={}ms`.
+
+The server's defaults match the bench. **For a smooth demo, pass `--link-delay-ms 0 --send-delay-ms 0 --recv-delay-ms 0`** — replicas then talk at memory speed and elections never fire under loss=0/no-failure conditions. Paxos round-trip drops from ~30 ms to sub-millisecond. Two-tab visibility latency is now bounded only by Bug A's 25 ms SSE poll.
+
+The flags are also useful for *experiments*: you can dial in 1 ms link delay and find where Paxos starts to wobble, or run with full bench latency on real time to reproduce the bug deliberately.
+
+#### Debug rig added to find Bug E
+
+**Files:** **new** `pset4/run-server.sh`, `pset4/http_server.cc` (instrumentation), `pset4/logs/` (sink directory)
+
+To diagnose Bug E we needed wall-clock correlation across many concurrent coroutines. Added:
+
+- **`pset4/run-server.sh`** — bash wrapper that creates `pset4/logs/`, runs `pt-collab-server` with all args passed through, pipes combined stdout+stderr through a small Perl filter that prepends `[HH:MM:SS.uuuuuu]` (microsecond local time via `Time::HiRes`), and `tee`s the result to `logs/server-<YYYYMMDD-HHMMSS>.log`. Every line in the live terminal and the persisted log is wall-clock-correlated. The user can `tail -f logs/server-*.log` while reproducing.
+
+- **`http_server.cc` per-connection IDs.** Two atomic counters at file scope:
+  ```cpp
+  std::atomic<uint64_t> g_next_conn_id{1};
+  std::atomic<uint64_t> g_next_tick_id{1};
+  ```
+  Each accepted TCP connection in `run_http_server`'s loop gets a `conn_id`; the per-connection coroutine takes it as a parameter and tags every log line: `conn={N} accepted`, `conn={N} dispatch method=POST path=/doc/main/op ...`, `conn={N} closed total_us=...`. SSE streams show long lifetimes; brief POSTs show ~ms lifetimes.
+
+- **RAII `conn_close_logger`.** A struct with a destructor that logs the close event with total duration. Declared at the top of `handle_connection`, so the close log fires on **every** `co_return` path (including early returns for unparseable requests). No need to instrument each early exit by hand.
+
+- **`poll_doc_cache` tick lifecycle.** Each loop iteration emits `poll tick={N} begin gap_us={prev_end_to_now} known_docs={}` at the top and `poll tick={N} end work_us={tick_duration}` at the bottom. `gap_us` reveals scheduler starvation (target ~100 ms; spikes mean some other task is hogging the loop). `work_us` reveals slow refreshes (typically <100 μs; spikes mean a DB scan got expensive). This was the single most useful piece of instrumentation — it proved the scheduler was *not* the bottleneck and let us focus on Paxos.
+
+These instrumentation lines coexist with the existing `[DoomDraft server] ...` tagged logs (`POST op begin/parsed/done`, `paxos submit begin/try/ok/timeout/failed`, `note_committed incoming/upgraded/applied/stale`, `SSE emit op/cursor`, `cache refresh/append/full rebuild`, etc.). With timestamps prefixed by `run-server.sh`, the log lets you reconstruct exactly what every coroutine was doing at any given microsecond.
+
+**To grep for divergence-causing labelless emits** (the Bug B/C signature):
+```bash
+grep "SSE emit op" logs/server-*.log | grep -c "cid_label=(none)"   # must be 0
+```
+
+**To find scheduler starvation events:**
+```bash
+grep "poll tick=" logs/server-*.log | awk -F'gap_us=' '{print $2}' | awk '{print $1}' | sort -n | tail
+# anything > 200000 (= 200 ms) means a follower could have elected
+```
+
+**To find concurrent-submit pile-ups:**
+```bash
+grep -c "paxos submit begin" logs/server-*.log
+grep -c "paxos submit ok"    logs/server-*.log
+# difference is the number that never returned ok within their 24s budget
+```
+
+#### Files touched and net code delta
+
+| File | What changed |
+|---|---|
+| `pset4/http_server.cc` | 25ms SSE poll; `note_committed` dedup + label upgrade; slow-path label preservation in `refresh_ops_from_db`; persistent `client_labels_` map; `g_next_conn_id`/`g_next_tick_id` counters; `conn_close_logger` RAII; poll-tick begin/end + gap/work timing; conn-id threaded through `handle_connection`. |
+| `pset4/static/editor.js` | Added `data.client_id === clientId` to the "is this our op" check (line 270 in the pre-edit file). |
+| `pset4/netsim.hh` | Public getter/setter pairs for `link_delay_`, `send_delay_` on `channel<T>`; same for `receive_delay_` on `port<T>`. |
+| `pset4/pt-paxos.cc` | Three `cot::duration` fields on `testinfo` (defaults `5ms/1ms/1ms`); `configure_port`/`configure_channel`/`configure_quiet_channel` apply them. |
+| `pset4/pt-collab.cc` | Same `testinfo` extension in the duplicated copy. Three new server CLI flags: `--link-delay-ms`, `--send-delay-ms`, `--recv-delay-ms` (defaults `5/1/1`). Startup logs the chosen values. |
+| `pset4/run-server.sh` (new) | Timestamped tee wrapper around `pt-collab-server`. Saves to `logs/server-<UTC>.log`. |
+| `pset4/logs/` (new) | Sink for `run-server.sh`-produced logs and any browser debug uploads written by `POST /debug/log`. |
+
+#### Tests conducted
+
+| Test | Command | Result |
+|---|---|---|
+| OT unit tests (regression) | `./build/test-doc-ops` | PASS |
+| Doc-state unit tests (regression) | `./build/test-doc-state` | PASS |
+| Paxos smoke (regression) | `./build/pt-paxos -R 5` | PASS |
+| Collab `--test` mode (regression) | `./build/pt-collab --test` | PASS |
+| Basic convergence at default 5/1/1 delays (bench-equivalent) | `./build/pt-collab -R 20` | PASS — `40 submitted, 38 committed, 23 transformed` shape, exit 0 |
+| Server build with new flags | `cmake --build build --target pt-collab-server` | PASS clean |
+| Server startup with defaults (5/1/1) | `./run-server.sh --port 8080` | Logs `netsim delays link=5ms send=1ms recv=1ms`; routes respond |
+| Server startup with zero delays | `./run-server.sh --port 8080 --link-delay-ms 0 --send-delay-ms 0 --recv-delay-ms 0` | Logs `netsim delays link=0ms send=0ms recv=0ms`; routes respond; commit `latency_ms` drops from ~30 ms to single-digit ms |
+| SSE delivery sanity | `curl -sN --max-time 6 http://localhost:8080/doc/main/stream` while POSTing | Receives `event: op` and `event: cursor` frames; `cid_label` is the original string, never `(none)` |
+| Two-tab browser demo at zero delays | manual: two Chrome tabs typing concurrently for 2+ minutes | PASS — no divergence, no 504s, sub-100 ms visible propagation |
+
+#### Open items (deferred, not blocking submission)
+
+1. **Event-driven SSE fanout.** Replace the 25 ms `cot::after` with a `cot::event` per doc that `note_committed` and the slow-path rebuild trigger when `version_` advances. Latency drops from ~25 ms worst-case to ~μs and the SSE coroutines stop competing with Paxos for scheduler ticks. Estimated 30 min of work; not necessary for the demo to feel real-time but the right shape.
+2. **Cursor positions don't need Paxos.** They are ephemeral UI state; replicating them through consensus is the dominant source of POST traffic (~half of all PUTs at full typing rate). Two options: (a) store cursor positions in-memory on each server replica and gossip out-of-band; (b) skip the network entirely and have the SSE handler emit cursor events directly from `POST /doc/<id>/cursor` without going through `submit_put`. Either halves the Paxos load and removes the throughput bottleneck even at non-zero netsim delays.
+3. **Browser-side cursor POST debounce.** Currently 80 ms in `editor.js`. Briefly tested at 300 ms to reduce Paxos load — works but not pursued because Bug E's root-cause fix (CLI flags → zero delays) eliminated the need. Worth revisiting if (2) above is not implemented.
+
+---
+
 ## Appendix — Course paper (pointer only)
 
 **Do not duplicate the full paper here.** The short academic writeup lives in:

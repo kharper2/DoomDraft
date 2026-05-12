@@ -42,15 +42,29 @@ struct testinfo {
   std::optional<size_t> ignored_replica_for_check;
   failure_schedule_kind failure_schedule = failure_schedule_kind::none;
 
+  // Per-message simulated network delays. Defaults match the historical bench
+  // values so collab-bench.sh seeds run with the same timing as before. The
+  // server (pt-collab-server) overrides these to 0 via CLI flags because
+  // in-process replicas have no real link latency and the simulated delays
+  // trigger Paxos elections under wall-clock time.
+  cot::duration link_delay = 5ms;
+  cot::duration send_delay = 1ms;
+  cot::duration receive_delay = 1ms;
+
   template <typename T> void configure_port(netsim::port<T>& port) {
     port.set_verbose(verbose);
+    port.set_receive_delay(receive_delay);
   }
   template <typename T> void configure_channel(netsim::channel<T>& chan) {
     chan.set_loss(loss);
     chan.set_verbose(verbose);
+    chan.set_link_delay(link_delay);
+    chan.set_send_delay(send_delay);
   }
   template <typename T> void configure_quiet_channel(netsim::channel<T>& chan) {
     chan.set_loss(loss);
+    chan.set_link_delay(link_delay);
+    chan.set_send_delay(send_delay);
   }
 };
 
@@ -1154,13 +1168,13 @@ int main(int argc, char* argv[]) {
   size_t nreplicas = 3;
   std::string doc_id = "main";
 
-  // Server defaults: 0ms across the board. The simulated netsim latency
-  // (5/1/1ms) is irrelevant for an in-process server and triggers Paxos
-  // election storms under wall-clock time. Override via flags if you want
-  // to reproduce bench-like network conditions.
-  unsigned link_delay_ms = 0;
-  unsigned send_delay_ms = 0;
-  unsigned recv_delay_ms = 0;
+  // Server defaults match the bench's historical netsim values (5/1/1 ms).
+  // Pass --link-delay-ms 0 --send-delay-ms 0 --recv-delay-ms 0 to remove the
+  // simulated latency, which is what you want for a smooth in-process demo —
+  // under wall-clock time the bench values can trigger Paxos election storms.
+  unsigned link_delay_ms = 5;
+  unsigned send_delay_ms = 1;
+  unsigned recv_delay_ms = 1;
 
   auto shortopts = short_options_for(server_options);
   int ch;
@@ -1199,6 +1213,12 @@ int main(int argc, char* argv[]) {
   tester.nreplicas = nreplicas;
   tester.failure_schedule = failure_schedule_kind::none;
   tester.randomness.seed(0xD00Du);
+  tester.link_delay    = std::chrono::milliseconds(link_delay_ms);
+  tester.send_delay    = std::chrono::milliseconds(send_delay_ms);
+  tester.receive_delay = std::chrono::milliseconds(recv_delay_ms);
+  std::print(std::cerr,
+             "[DoomDraft server] netsim delays link={}ms send={}ms recv={}ms\n",
+             link_delay_ms, send_delay_ms, recv_delay_ms);
 
   http_client_model client(tester.nreplicas, tester.randomness);
   pt_paxos_instance inst(tester, client);
