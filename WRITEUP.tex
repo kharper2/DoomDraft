@@ -1,0 +1,288 @@
+\documentclass[11pt]{article}
+
+% -------- packages --------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue!50!black,
+  citecolor=black
+}
+
+% Tighter section spacing
+\titlespacing*{\section}{0pt}{1.4ex plus 0.4ex minus 0.2ex}{0.7ex plus 0.2ex}
+\titlespacing*{\subsection}{0pt}{1.0ex plus 0.2ex minus 0.2ex}{0.5ex plus 0.2ex}
+
+\lstdefinestyle{plain}{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false,
+  frame=single,
+  framesep=4pt,
+  framerule=0.3pt,
+  rulecolor=\color{black!40},
+  xleftmargin=4pt,
+  xrightmargin=4pt
+}
+\lstset{style=plain}
+
+\title{\textbf{DoomDraft: A Collaborative Text Editor over Simulated Paxos with Operational Transformation}}
+\author{Kathryn Harper \and Aengus McGuinness\\[0.3em]
+\small CS\,2620 -- Distributed Systems Final Project\\
+\small Harvard University, Spring 2026}
+\date{May 12, 2026}
+
+% -------- shortcuts --------
+\newcommand{\code}[1]{\texttt{#1}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent We present \textbf{DoomDraft}, a two-user collaborative text editor whose backend is a fault-tolerant Paxos cluster (running under the course's Cotamer coroutine simulator) and whose convergence semantics are provided by character-level Operational Transformation (OT). Edits commit through Paxos as inserts or deletes on a per-document append-only log stored in PancyDB. Each client transforms its pending local operations against the Paxos-ordered suffix it has not yet observed, guaranteeing that all live replicas reconstruct the same document text. We validate correctness in three layers: unit tests with a randomized diamond-property checker (846 successful trials over 1{,}000 candidates), a failure-schedule matrix (\code{collab-bench.sh}) exercising leader failover, recovery, partitions, and 15\,\% lossy networks across hundreds of seeds, and a live HTTP/SSE-based browser client supporting two-tab concurrent editing. We also document a set of subtle bugs that surfaced during a mid-project upstream upgrade to the Cotamer library --- including a label-stripping race between the cache poller and the commit handler, and a network-simulation latency that became real-wall-clock latency after a clock-semantics change --- and the targeted fixes that resolved them.
+\end{abstract}
+
+\section{Introduction}
+
+Collaborative text editors have become a daily tool for distributed work, yet the systems underneath them blend two non-trivial problems: \emph{consensus} on the global order of edits, and \emph{convergence} of locally optimistic edits to a single canonical text. Real systems (Google Docs, Etherpad, Figma's text fields) handle these together but typically as a black box. The goal of this project was to build, validate, and exercise a small but complete instance of the same architecture end-to-end, in such a way that each subsystem could be tested independently and the failure modes of the whole could be observed deliberately.
+
+We chose a deliberately constrained design: characters as the unit of replication, in-process simulated Paxos for consensus, an append-only log of operations in a single-writer key/value store (PancyDB), Operational Transformation (OT) as the convergence mechanism, and a thin HTTP/Server-Sent-Events (SSE) layer to bridge real browsers to the simulated cluster. The system supports multiple documents, two simultaneous browser tabs editing a shared document, cursor-position broadcast, and on-demand replica failure injection during a live editing session.
+
+The contributions of this paper are:
+\begin{enumerate}[leftmargin=*,itemsep=0.1em]
+  \item A complete C++ implementation of Jupiter-style character-level OT with the four canonical transform cases and six delete-delete sub-cases, validated by 846 randomized diamond-property trials.
+  \item A coroutine-based collaborative client model that interleaves Paxos submission, leader-redirect handling, and OT-transformation of pending operations against newly observed peer commits.
+  \item A hand-rolled HTTP/1.1 and SSE server on top of Cotamer's TCP primitives, with multi-document routing, optimistic in-memory caching, and live cursor broadcast.
+  \item A static-file browser editor whose OT transform is a direct port of the C++ implementation and which uses a single-in-flight submission pipeline to keep classification of confirmation events tractable.
+  \item A failure-schedule test matrix (\code{collab-bench.sh}) that exercises eight distinct fault scenarios, including 15\,\% message loss and adversarial replica scheduling, with reconstructed-text comparison across all live replicas as the correctness oracle.
+  \item A post-mortem of four subtle bugs uncovered during a mid-project library upgrade and the corresponding targeted fixes.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{Operational Transformation.} OT was introduced by Ellis and Gibbs \cite{ellis-gibbs} in the context of the GROVE groupware system; subsequent work formalized correctness conditions and explored the space of transform functions. The Jupiter system \cite{jupiter} introduced a client--server variant in which a central authority linearizes all operations and clients OT-transform only against confirmed-by-server operations, simplifying correctness. Google Wave \cite{wave} extended this to a wider operation alphabet with annotations; Etherpad uses a similar server-as-authority model. The four-cases-with-six-DD-subcases formulation we implement follows the standard character-level OT presentations in the literature.
+
+\textbf{Conflict-free Replicated Data Types (CRDTs).} An alternative approach pioneered by Shapiro et al.\ \cite{crdts} eliminates the need for transform functions by encoding operations in a partial order that is automatically convergent. Sequence CRDTs (RGA \cite{rga}, Logoot \cite{logoot}, and modern implementations such as Yjs and Automerge) are now common in peer-to-peer collaborative editors. We chose OT here because (a) it pairs naturally with a totally-ordered Paxos log --- the transform domain is exactly ``operations queued locally after a known commit point'' --- and (b) operation state is bounded by the number of committed operations, which is easier to reason about in a class project than CRDT identifiers.
+
+\textbf{Consensus.} Lamport's Paxos \cite{paxos} provides the underlying total-order broadcast. The coursework's Cotamer simulator implements a Multi-Paxos-style replicated log (in spirit closer to Raft \cite{raft} in its leader-based formulation), with explicit leader election, log replication, and commit acknowledgments. PancyDB sits on top of this log as a single-key state machine that maps each committed PUT to a monotonically increasing version. This is precisely the abstraction OT requires: a globally agreed sequence of edits, against which clients can compute transforms.
+
+\textbf{Server-Sent Events.} For the browser interface we chose SSE \cite{sse} over WebSocket. SSE is one-directional (server $\rightarrow$ client) push over a long-lived HTTP/1.1 connection; it requires no protocol negotiation, fits naturally on top of Cotamer's TCP primitives, and degrades gracefully through proxies. The browser side uses the native \code{EventSource} API, which transparently handles reconnects with \code{Last-Event-ID} resume semantics.
+
+\section{Design}
+
+\subsection{Architecture}
+
+DoomDraft has four major layers (Figure \ref{fig:arch}). The lowest is the Cotamer/PancyDB Paxos cluster, simulating three replicas with configurable message loss, link delay, and explicit failure schedules. Above this is the \code{collab\_model} client, which submits edits as Paxos PUTs and uses OT to reconcile peer operations against locally pending ones. The HTTP server (\code{pt-collab-server}) embeds the cluster in-process and exposes routes for document state, op submission, cursor broadcast, and an SSE stream. The browser editor is a single static HTML page with a JavaScript port of the OT transform.
+
+\begin{figure}[h]
+\centering
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
++-------------------+   POST /op       +---------------+
+|  browser tab(s)   | ---------------> |               |
+|  (static JS + OT) | <==SSE: op,cur== |  HTTP server  |
++-------------------+                  |  (http_server)|
+                                       |       |       |
+                                       |       v       |
+                                       | http_client_  |
+                                       |    model      |
+                                       +-------+-------+
+                                               | PUT
+                                               v
+                                  +----------------------+
+                                  |  pt_paxos_instance   |
+                                  | (3 replicas, Cotamer)|
+                                  |     leader + 2 fol-  |
+                                  |     lowers, netsim   |
+                                  +----------------------+
+                                               |
+                                               v
+                                       per-replica PancyDB
+                                  (keys: doc/<id>/op/<cid>/<seq>)
+\end{lstlisting}
+\caption{High-level architecture. Browser tabs talk to a single in-process server that funnels every write through a Paxos cluster. SSE events stream committed operations back out.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Why OT on a Paxos log}
+
+The motivating observation is that OT becomes substantially simpler when the universe of ``operations my pending ops have not yet seen'' is itself a totally ordered prefix. In the general Jupiter problem each pair of sites must transform symmetrically against each other; in our setting, Paxos imposes the global order, so every client only needs to transform its local pending operations against the suffix of committed operations it has not yet observed. The transform function is therefore one-sided: \code{transform(a, b)} returns \code{a'} such that ``\code{a} as it should be executed after \code{b} has already been applied.'' Convergence follows from the fact that every live replica eventually reconstructs the same totally-ordered prefix and replays operations through the same \code{apply\_op}.
+
+\subsection{Data model}
+
+A document is identified by an opaque string \code{doc\_id}. Each committed operation is stored at the key
+\[
+  \text{\code{doc/<doc\_id>/op/<hash(client\_id)>/<client\_seq>}}
+\]
+with the operation itself serialized as a small text value (\code{I pos text...} for insert or \code{D pos len} for delete). The \code{hash(client\_id)} is a 64-bit FNV-1a of the client's string label; \code{client\_seq} is the per-client monotonic sequence number. A document's full text at any point is reconstructed by reading every key under the \code{doc/<doc\_id>/op/} prefix, sorting by (PancyDB version, client\_id, client\_seq), and applying each operation in order from the empty string. Cursor positions live under \code{doc/<doc\_id>/cursor/<hash>} and are broadcast via SSE without affecting document text.
+
+\subsection{OT transform function}
+
+The transform follows the standard four-case partition by the type pair $(a, b)$:
+
+\begin{itemize}[leftmargin=*,itemsep=0.1em]
+  \item \textbf{Insert / Insert.} If \code{b.pos $\le$ a.pos}, shift \code{a.pos} right by $|b.text|$; otherwise unchanged. Same-position ties shift \code{a} right (\code{b} ``wins'' as the already-applied op).
+  \item \textbf{Insert / Delete.} If \code{a.pos $\le$ b.pos}, unchanged. If \code{a.pos $\ge$ b.pos + b.len}, shift left by \code{b.len}. If the insertion point is inside \code{b}'s deleted region, return a no-op insert (\code{insert\_op\{0, ""\}}); this is the only single-op return that preserves the diamond property.
+  \item \textbf{Delete / Insert.} Mirror of the above, except that an insert inside \code{a}'s range \emph{expands} \code{a.len} by $|b.text|$ rather than collapsing.
+  \item \textbf{Delete / Delete.} Six sub-cases by overlap relation (disjoint left, disjoint right, one fully containing the other, two partial-overlap cases, equal). The complete table is implemented in \code{doc\_ops.cc} and exercised by \code{test-doc-ops}.
+\end{itemize}
+
+A single \code{transform\_seq(a, committed)} routine folds \code{transform} left-to-right across a committed sequence, yielding \code{a} adjusted to be applied after that entire sequence.
+
+\section{Implementation}
+
+\subsection{Component-level implementation}
+
+\textbf{\code{doc\_ops.cc}} defines \code{insert\_op}/\code{delete\_op} as a \code{std::variant} \code{doc\_op}, with text-based \code{serialize} / \code{deserialize}, an in-place \code{apply\_op} that clamps out-of-range positions and lengths, and the transform function described above. The same file contains a \code{\#ifdef RUN\_DOC\_OPS\_TESTS}-gated \code{main()} that exercises hand-crafted cases for every transform branch and runs 1{,}000 randomized diamond trials.
+
+\textbf{\code{doc\_state.cc}} implements \code{read\_ops}, which walks PancyDB under the doc-op prefix, parses the suffix \code{<cid>/<seq>} (rejecting malformed keys), deserializes each value, sorts the resulting \code{committed\_op}s by \code{(version, client\_id, client\_seq)}, and returns the vector. \code{reconstruct} folds \code{apply\_op} over that vector.
+
+\textbf{\code{collab\_model.cc}} implements the per-client editor coroutine. Each editor maintains a \code{pending} queue of locally optimistic operations, a per-peer \code{next\_seq} watermark, and a current leader hint. On each iteration it (a) polls peers for the next expected committed op (GET requests routed through the Paxos cluster), (b) on success transforms its pending queue against the new committed op and either pops a confirmation or applies a foreign op to local text, and (c) generates a random new insert or delete with probability 0.6, applies it optimistically, and submits the head of the pending queue.
+
+\textbf{\code{http\_server.cc}} is a hand-rolled HTTP/1.1 parser and SSE writer on Cotamer's \code{tcp\_listen}/\code{tcp\_accept}. Routes are: \code{GET /doc/<id>} (full text plus version), \code{POST /doc/<id>/op} (submit one operation), \code{GET /doc/<id>/stream} (long-lived SSE), \code{POST /doc/<id>/cursor} (broadcast cursor position), \code{GET /docs} / \code{POST /docs} (document registry), \code{POST /admin/fail/<rid>} (live failure injection), plus static-file routes for the browser. The cache for SSE delivery is updated by a single shared background poller (\code{poll\_doc\_cache}) plus eager updates from the POST handler (\code{note\_committed}).
+
+\textbf{Browser client} (\code{static/editor.html}, \code{static/editor.js}). A single-page editor with a textarea, server URL / doc-id / connect controls, a peer-cursor overlay, and a status badge. The JavaScript OT transform is a line-for-line port of the C++ function (including the same tie-break rules) so that the two sides reach identical results on the same input sequences. A \code{runTests()} function in the browser console runs the same 21 transform vectors as \code{test-doc-ops}.
+
+\subsection{Key implementation choices}
+
+\textbf{One in-flight submission per browser.} The browser pipeline submits the head of the pending queue, waits for either an SSE confirmation or the POST response, and only then submits the next. This makes ``is this incoming SSE event my own confirmation?'' a tractable question --- it's our pending head if and only if \code{seq} matches \code{pending[0].seq}, \code{mySeqs} contains it, and \code{client\_id} matches our own \code{clientId} (see Section \ref{sec:detours}).
+
+\textbf{Strings vs.\ hashes for client identity.} The Paxos key namespace and the cache use a 64-bit FNV-1a hash of the client's string id; the wire format (both JSON POST bodies and SSE events) uses the original string. This avoids hash collisions in routing while keeping events human-debuggable. The server maintains a persistent \code{client\_labels\_} map (hash $\rightarrow$ string) so that even ops first observed via DB polling --- which lose the string label --- get re-stamped on emit (Section \ref{sec:detours}, Bug B).
+
+\textbf{Cache-first reads, eager updates.} \code{GET /doc/<id>} reads from the in-memory cache, not the DB. The cache is refreshed by a 100\,ms background poller; the POST handler also updates the cache synchronously after a Paxos commit, so the round-trip ``POST then GET'' on the same connection sees the new state. SSE uses the same cache; the per-subscriber loop polls every 25\,ms (down from an initial 250\,ms after observability tuning).
+
+\textbf{Coroutine isolation of HTTP.} The HTTP layer reuses Cotamer coroutines rather than introducing real threads, so the entire server is single-threaded cooperative. This avoided any cross-thread mutation issues on \code{ops\_} and \code{cursors\_}, but did make scheduler-starvation regressions a real risk (Section \ref{sec:detours}, Bug E).
+
+\subsection{Interesting detours}\label{sec:detours}
+
+This subsection documents four subtle bugs that surfaced during a mid-project upgrade of Cotamer. Each was reproducible in the two-tab browser demo and invisible to all simulation-layer tests; together they motivated a substantial debugging-infrastructure investment.
+
+\paragraph{Bug A --- Label race between commit handler and cache poller.}
+The HTTP \code{POST /op} handler runs in two phases separated by a \code{co\_await} on \code{submit\_put}: it parses JSON (and thereby learns the client's string \code{client\_id}), awaits Paxos consensus, then calls \code{cache.note\_committed} with the labeled operation. Independently, \code{poll\_doc\_cache} reads each replica's PancyDB every 100\,ms and may discover the new commit \emph{before} the handler resumes. The poller has only the hashed client id (the DB doesn't store the string), so it would append a \emph{labelless} entry. When the handler then ran \code{note\_committed}, it appended a \emph{labeled} entry, leaving \code{ops\_} with two rows for the same logical operation. The SSE stream emitted both, the browser received one numeric and one string \code{client\_id} for the same \code{seq}, and the receiving tab failed to deduplicate.
+
+The fix is two-layered. \code{note\_committed} now scans \code{ops\_} for an existing \code{(client\_id, client\_seq)} and \emph{upgrades} the existing label rather than appending. This is reactive --- if SSE has already snapshotted the labelless row, it has already emitted it. A proactive layer was therefore added: \code{client\_labels\_}, a persistent map keyed by \code{cid\_hash}, populated at POST entry (\emph{before} \code{co\_await submit\_put}). \code{refresh\_ops\_from\_db}'s fast path now stamps the label on any new row whose hash is in this map. The race window closes before it opens.
+
+\paragraph{Bug B --- Slow-path full rebuild discards labels.}
+\code{refresh\_ops\_from\_db} has a fast path (when \code{fresh} extends \code{ops\_} prefix-by-prefix) and a slow path (when the prefix invariant is violated, typically by a Paxos retry creating a new commit slot for an already-committed key with a higher version). The slow path was \code{ops\_ = std::move(fresh); text\_ = reconstruct(ops\_);}, which wiped all known labels because \code{fresh} comes from \code{read\_ops}, which knows only hashes. Every SSE event for the doc thereafter carried numeric \code{client\_id}s. Fixed by snapshotting \code{(client\_id, client\_seq) $\rightarrow$ label} from \code{ops\_} before the move and restoring after; the persistent \code{client\_labels\_} from Bug A's fix serves as a secondary recovery layer for labels that were never in \code{ops\_} at all.
+
+\paragraph{Bug C --- Browser classified peer ops as own confirmations by seq alone.}
+Each browser tab initializes \code{nextSeq = 0}, so both tabs submit their first operation with \code{seq = 0}, second with \code{seq = 1}, etc. The original classifier for incoming SSE events tested only \code{data.seq === pending[0].seq \&\& mySeqs.has(data.seq)}. With two tabs concurrently typing, tab~A's still-pending \code{seq=0} would match tab~B's just-committed \code{seq=0} event; tab~A would pop its own pending op without applying it, transform nothing, and silently drop the edit. The visible signature was deterministic strings like \code{This works until it} drifting against \code{This NN works...}. The fix requires \code{data.client\_id === clientId} as well; the server must therefore consistently emit the string \code{client\_id}, which is what Bugs A and B exist to guarantee. The three fixes are co-dependent: each is necessary, none is individually sufficient.
+
+\paragraph{Bug D --- Bench-time network delays became wall-clock delays.}
+Cotamer's \code{netsim} layer imposes per-message delays (\code{link\_delay = 5\,ms}, \code{send\_delay = 1\,ms}, \code{receive\_delay = 1\,ms}) intended to simulate a non-trivial network. The course's clock-selection enum prior to a mid-semester upstream update had \code{clock::virtual\_time == 0} and \code{clock::real\_time == 0} (numerically identical), so the call \code{cot::set\_clock(cot::clock::real\_time)} in our server's \code{main} was a no-op. The server in fact ran on the virtual clock, where \code{cot::after(5ms)} between in-process coroutines waits approximately zero wall-clock time. The upstream upgrade re-enumerated \code{real\_time = 1}, so the call finally meant what it had always read like, and every netsim delay began consuming real wall-clock time. Each Paxos round-trip took $\sim$30\,ms; under sustained two-tab typing (roughly 20 ops/s plus cursor updates) the leader's outbound send queue saturated, heartbeats fell behind the queue, follower election timeouts (200--350\,ms) triggered, and the cluster entered a leader-election storm in which no client requests committed for $\sim$24\,s windows (the HTTP retry budget).
+
+The fix exposes the three netsim delays as CLI flags on \code{pt-collab-server}: \code{--link-delay-ms}, \code{--send-delay-ms}, \code{--recv-delay-ms}. Defaults match the bench (\code{5/1/1}) to preserve the simulation tests' timing. Passing \code{0/0/0} makes the server behave like a real in-process system, eliminating the synthetic latency and reducing Paxos round-trips from $\sim$30\,ms to sub-millisecond. The flags are also useful as a knob: dial the link delay upward and observe the threshold at which Paxos timing parameters and netsim latency become incompatible.
+
+\subsection{Debugging infrastructure}
+
+The diagnosis of Bugs A--D depended on instrumentation built up during the investigation, included for general utility:
+
+\begin{itemize}[leftmargin=*,itemsep=0.1em]
+  \item \code{run-server.sh} wraps \code{pt-collab-server} with a Perl filter that prepends each stdout/stderr line with \code{[HH:MM:SS.uuuuuu]} (microsecond-resolution local time) and tees output to a timestamped file in \code{logs/}.
+  \item Every accepted TCP connection in the server is tagged with a monotonic \code{conn\_id}; an RAII guard logs the connection's total wall-clock duration when its coroutine frame is destroyed, regardless of which \code{co\_return} path was taken.
+  \item Each iteration of \code{poll\_doc\_cache} logs \code{poll tick=N begin gap\_us=X known\_docs=K} at entry and \code{poll tick=N end work\_us=Y} at exit. \code{gap\_us} reveals scheduler starvation (steady $\sim$100\,000\,$\mu s$ in healthy operation; spikes mean some other task is monopolizing the loop); \code{work\_us} reveals slow refreshes (typically $<$100\,$\mu s$).
+  \item Every cache mutation (\code{note\_committed}, \code{refresh\_ops\_from\_db} append, slow-path full rebuild, cursor cache change) logs both inputs and a debug-truncated snapshot of \code{text\_}.
+\end{itemize}
+
+This instrumentation was decisive for Bug D: by demonstrating that \code{gap\_us} remained $\sim$100\,ms and \code{work\_us} remained $<$1\,ms throughout a stalled session, we could rule out scheduler starvation and focus diagnosis on the Paxos layer itself.
+
+\section{Evaluation}
+
+\subsection{Unit-level correctness}
+
+\code{test-doc-ops} runs hand-crafted cases for every transform branch plus 1{,}000 randomized diamond trials over random documents and operation pairs. Of the 1{,}000 randomized trials, 154 are skipped because they fall into the same-position concurrent-insert case (a documented limitation of pure-position OT without a tie-break field; the production system uses \code{client\_id} ordering to disambiguate, which is not modeled in \code{transform} itself). The remaining 846 trials all confirm:
+\[
+  \text{\code{apply(apply(doc, a), transform(b, a))} $=$ \code{apply(apply(doc, b), transform(a, b))}}.
+\]
+
+\code{test-doc-state} validates \code{read\_ops} and \code{reconstruct} across eight cases including empty DB, single insert, multi-op single client, cross-client version ordering, insert-then-delete, and gracefully skipping malformed values.
+
+\subsection{Failure-schedule matrix}
+
+\code{collab-bench.sh} runs eight rows of failure schedules against \code{pt-collab}, with reconstructed-text equality across all live replicas as the correctness oracle (Table \ref{tab:bench}). The full matrix completes in $\sim$2 minutes on a 2024 Apple M2 MacBook Pro and passes on every seed.
+
+\begin{table}[h]
+\centering
+\caption{Failure-schedule matrix run via \code{collab-bench.sh}. All rows pass.}
+\label{tab:bench}
+\begin{tabular}{l l l l}
+\toprule
+\textbf{Row} & \textbf{Failure schedule} & \textbf{Seeds} & \textbf{Result}\\
+\midrule
+1 & OT \& doc-state via binary (\code{--test}) & ---            & PASS \\
+2 & Basic convergence                          & 100            & PASS \\
+3 & Failover (\code{-f failover})              & 50             & PASS \\
+4 & Recovery (\code{-f recover})               & 50             & PASS \\
+5 & Split brain (\code{-f split})              & 50             & PASS \\
+6 & Unstable membership (\code{-f unstable})   & 30             & PASS \\
+7 & Adversarial schedule (\code{-f torture})   & 20             & PASS \\
+8 & 15\,\% message loss (\code{-l 0.15})       & 100            & PASS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 15\,\% loss row is the most aggressive correctness test: per-message Bernoulli drops with $p=0.15$ create both spurious leader elections (heartbeats lost) and dropped client responses (driving retry logic). All 100 seeds reach quiescent convergence with all live replicas reconstructing identical text.
+
+\subsection{Latency under the live demo}
+
+We measured Paxos commit latency by instrumenting the HTTP POST handler to log \code{latency\_ms} per commit. With default netsim parameters (\code{5/1/1\,ms}) the median POST commit takes 28--32\,ms, dominated by the four message hops in a Paxos round-trip ($\sim$7\,ms each: $\sim$5\,ms link plus $\sim$1\,ms send and $\sim$1\,ms receive). With netsim delays set to zero via the CLI flags the median drops below 1\,ms, and the visible end-to-end propagation in the two-tab demo --- from a keystroke in tab A to the corresponding character appearing in tab B --- becomes bounded by the 25\,ms SSE polling interval (median observed: 35--80\,ms).
+
+Under sustained two-tab concurrent typing for several minutes with default netsim delays at $0/0/0$, no \code{504 Gateway Timeout} responses were observed and the textareas converged at every paragraph break. With default delays restored to $5/1/1$, sustained typing for $\sim$10 seconds reproduces the leader-election storm of Bug D, with the predicted symptom of $\sim$7 concurrent in-flight \code{submit\_put}s all timing out simultaneously.
+
+\subsection{Reproducibility}
+
+The build is a single CMake configure-and-build under the project's homebrew-Clang toolchain. Every test in this paper is reproducible from the repository's \code{pset4} directory with the commands:
+\begin{lstlisting}[language=bash]
+cmake -B build -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+cmake --build build
+./build/test-doc-ops          # 1.000 randomized OT trials
+./build/test-doc-state        # PancyDB reconstruction
+bash collab-bench.sh          # Full 8-row failure matrix
+./run-server.sh --port 8080 \
+    --link-delay-ms 0 --send-delay-ms 0 --recv-delay-ms 0
+\end{lstlisting}
+
+\section{Conclusion and Future Work}
+
+We built and validated a complete collaborative editor over a simulated Paxos cluster, including a hand-rolled HTTP/SSE bridge and a browser client that exercises the same OT semantics as the C++ simulation. The OT layer and the failure-injection harness together verify that all live replicas reconstruct the same document text under leader failover, partitions, lossy networks, and adversarial scheduling. The HTTP/SSE layer extends this correctness guarantee to real two-tab editing in a browser.
+
+The most pedagogically valuable surprise of the project was the cascade of bugs unmasked by an upstream library upgrade: a clock-semantics change that turned simulated network latency into real wall-clock latency, which exposed a race in the cache-update path, which exposed a label-stripping path in the cache slow rebuild, which exposed an under-specified client-id check in the JavaScript classifier. Each bug was individually subtle; collectively they made the production demo unreliable while every existing automated test continued to pass. The fix list above (Section~\ref{sec:detours}) reflects the actual order of diagnosis, and the new instrumentation (\code{run-server.sh}, per-connection IDs, poll-tick timing, persistent label cache) is preserved in the repository as a debugging foundation for future work.
+
+Several directions of follow-on work are worth noting.
+
+\textbf{Event-driven SSE fanout.} The current per-subscriber 25\,ms polling loop bounds visible propagation latency from below. A \code{cot::event} per document, triggered by \code{note\_committed} and the slow-path rebuild, would let each SSE coroutine \code{co\_await} for the next commit and wake within microseconds. The instrumentation already in place would directly measure the improvement.
+
+\textbf{Cursor positions outside Paxos.} Cursor broadcasts account for roughly half of all Paxos commits during active typing, yet they are ephemeral UI state. Moving them to a server-local cache (gossiped to subscribers via the SSE stream but not replicated through consensus) would halve the Paxos load and eliminate the throughput bottleneck even under non-zero netsim delays.
+
+\textbf{CRDT comparison.} An implementation of a sequence CRDT (RGA or similar) against the same browser frontend would allow direct comparison of state size, transform/merge complexity, and visible latency under the same workload, giving a concrete data point in the OT-vs.-CRDT debate that is usually argued in the abstract.
+
+\textbf{Beyond two tabs.} The current architecture has a single \code{http\_client\_model} multiplexing all HTTP submissions onto one Paxos client id with distinct serials. Higher-concurrency editing (say, eight tabs) would benefit from multiple client ids to allow parallel in-flight commits, and from a batched-PUT extension at the Paxos layer to amortize round-trip cost across multiple operations.
+
+\paragraph{Acknowledgments.} We thank the CS\,2620 staff for the Cotamer / PancyDB / Paxos starter infrastructure, and for the mid-semester library upgrade that made Section~\ref{sec:detours} possible.
+
+\begin{thebibliography}{9}
+\bibitem{ellis-gibbs} C.\ A.\ Ellis and S.\ J.\ Gibbs. ``Concurrency Control in Groupware Systems.'' \emph{Proc.\ ACM SIGMOD}, 1989.
+\bibitem{jupiter} D.\ A.\ Nichols, P.\ Curtis, M.\ Dixon, and J.\ Lamping. ``High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System.'' \emph{Proc.\ UIST}, 1995.
+\bibitem{wave} D.\ Wang, A.\ Mah, and S.\ Lassen. ``Google Wave Operational Transformation.'' Whitepaper, 2010.
+\bibitem{crdts} M.\ Shapiro, N.\ Pregui\c{c}a, C.\ Baquero, and M.\ Zawirski. ``Conflict-free Replicated Data Types.'' \emph{Proc.\ SSS}, 2011.
+\bibitem{rga} H.-G.\ Roh, M.\ Jeon, J.-S.\ Kim, and J.\ Lee. ``Replicated Abstract Data Types: Building Blocks for Collaborative Applications.'' \emph{J.\ Parallel and Distributed Computing}, 2011.
+\bibitem{logoot} S.\ Weiss, P.\ Urso, and P.\ Molli. ``Logoot: A Scalable Optimistic Replication Algorithm for Collaborative Editing on P2P Networks.'' \emph{Proc.\ ICDCS}, 2009.
+\bibitem{paxos} L.\ Lamport. ``Paxos Made Simple.'' \emph{ACM SIGACT News} 32(4), 2001.
+\bibitem{raft} D.\ Ongaro and J.\ Ousterhout. ``In Search of an Understandable Consensus Algorithm.'' \emph{USENIX ATC}, 2014.
+\bibitem{sse} I.\ Hickson. ``Server-Sent Events.'' W3C Recommendation, 2015.
+\end{thebibliography}
+
+\end{document}
