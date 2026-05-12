@@ -41,17 +41,31 @@ struct testinfo {
   size_t nreplicas = 3;
   size_t initial_leader = 0;
 
+  // Per-message simulated network delays. Defaults match the historical
+  // bench values so collab-bench.sh / pt-paxos / pt-collab behavior is
+  // unchanged. The server (pt-collab-server) overrides these to 0 because
+  // in-process replicas have no real link latency and the delays trigger
+  // Paxos elections under wall-clock time.
+  cot::duration link_delay = 5ms;
+  cot::duration send_delay = 1ms;
+  cot::duration receive_delay = 1ms;
+
   failure_schedule_kind failure_schedule = failure_schedule_kind::none;
 
   template <typename T> void configure_port(netsim::port<T> &port) {
     port.set_verbose(verbose);
+    port.set_receive_delay(receive_delay);
   }
   template <typename T> void configure_channel(netsim::channel<T> &chan) {
     chan.set_loss(loss);
     chan.set_verbose(verbose);
+    chan.set_link_delay(link_delay);
+    chan.set_send_delay(send_delay);
   }
   template <typename T> void configure_quiet_channel(netsim::channel<T> &chan) {
     chan.set_loss(loss);
+    chan.set_link_delay(link_delay);
+    chan.set_send_delay(send_delay);
   }
 };
 

@@ -66,6 +66,10 @@ private:
     random_source& randomness_;
     std::string id_;
     bool verbose_ = false;
+
+public:
+    cot::duration receive_delay() const noexcept { return receive_delay_; }
+    void set_receive_delay(cot::duration d) noexcept { receive_delay_ = d; }
 };
 
 
@@ -103,6 +107,11 @@ struct channel {
 
     double loss() const noexcept { return loss_; }
     void set_loss(double loss) noexcept { loss_ = loss; }
+
+    cot::duration link_delay() const noexcept { return link_delay_; }
+    void set_link_delay(cot::duration d) noexcept { link_delay_ = d; }
+    cot::duration send_delay() const noexcept { return send_delay_; }
+    void set_send_delay(cot::duration d) noexcept { send_delay_ = d; }
 
     // send a message on this channel
     cot::task<> send(message_type m);

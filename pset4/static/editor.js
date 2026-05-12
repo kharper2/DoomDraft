@@ -5,6 +5,70 @@
 
   /** @typedef {{type:'I',pos:number,text:string}|{type:'D',pos:number,len:number}} Op */
 
+  const DEBUG = true;
+
+  function nowTag() {
+    return new Date().toISOString().slice(11, 23);
+  }
+
+  function textHash(text) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
+  }
+
+  function preview(text) {
+    const s = String(text).replace(/\n/g, '\\n');
+    return s.length > 80 ? s.slice(0, 80) + '…' : s;
+  }
+
+  function opSummary(op) {
+    if (!op) return 'null';
+    if (op.type === 'I') return `I@${op.pos}+${op.text.length} "${preview(op.text)}"`;
+    return `D@${op.pos}x${op.len}`;
+  }
+
+  function pendingSummary() {
+    return s.pending.map((p) => `#${p.seq}:${opSummary(p.op)}`).join(', ') || '(none)';
+  }
+
+  function debug(label, data) {
+    if (!DEBUG) return;
+    const base = {
+      t: nowTag(),
+      clientId,
+      doc: el.doc() ? el.doc().value : undefined,
+      serverVersion: s.serverVersion,
+      inflightSeq: s.inflightSeq,
+      pending: pendingSummary(),
+      serverTextLen: s.serverText.length,
+      serverTextHash: textHash(s.serverText),
+      fullTextLen: fullText().length,
+      fullTextHash: textHash(fullText()),
+      textareaLen: el.ta() ? el.ta().value.length : undefined,
+      textareaHash: el.ta() ? textHash(el.ta().value) : undefined,
+    };
+    const entry = { ...base, label, ...(data || {}) };
+    console.log('[DoomDraft]', label, entry);
+    try {
+      const body = JSON.stringify(entry);
+      const url = apiUrl('/debug/log');
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
+      } else {
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          keepalive: true,
+        }).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
   function transform(a, b) {
     if (a.type === 'I' && b.type === 'I') {
       if (b.pos <= a.pos) return { type: 'I', pos: a.pos + b.text.length, text: a.text };
@@ -114,6 +178,8 @@
     serverVersion: 0,
     es: /** @type {EventSource|null} */ (null),
     cursorTimer: /** @type {number|null} */ (null),
+    cursorInflight: false,
+    cursorDirty: false,
     peerCursors: /** @type {Map<string, {pos:number, color:string}>} */ (new Map()),
   };
 
@@ -178,6 +244,16 @@
     if (ta.value !== want) {
       const sel = ta.selectionStart;
       const delta = want.length - ta.value.length;
+      debug('textarea resync', {
+        beforeLen: ta.value.length,
+        beforeHash: textHash(ta.value),
+        wantLen: want.length,
+        wantHash: textHash(want),
+        selectionStart: sel,
+        delta,
+        beforePreview: preview(ta.value),
+        wantPreview: preview(want),
+      });
       ta.value = want;
       try {
         ta.setSelectionRange(Math.max(0, sel + delta), Math.max(0, sel + delta));
@@ -202,21 +278,26 @@
 
   /** Apply local ack from POST /op body; SSE may duplicate the same version (ignored there). */
   function ackPostIfStillInflight(version, seq) {
+    debug('POST ack received', { version, seq });
     if (s.inflightSeq !== seq) {
+      debug('POST ack ignored: different inflight seq', { version, seq });
       sendPendingFront();
       return;
     }
     if (!s.pending.length || s.pending[0].seq !== seq) {
+      debug('POST ack ignored: pending front changed', { version, seq });
       s.inflightSeq = null;
       sendPendingFront();
       return;
     }
     if (version <= s.serverVersion) {
+      debug('POST ack ignored: stale version', { version, seq });
       s.inflightSeq = null;
       sendPendingFront();
       return;
     }
     const { op: committed } = s.pending[0];
+    debug('POST ack committing local op', { version, seq, op: opSummary(committed) });
     s.serverText = applyOp(s.serverText, committed);
     s.pending.shift();
     s.mySeqs.delete(seq);
@@ -228,11 +309,24 @@
   }
 
   async function sendPendingFront() {
-    if (s.inflightSeq !== null || !s.pending.length) return;
+    if (s.inflightSeq !== null || !s.pending.length) {
+      debug('sendPendingFront skipped', {
+        reason: s.inflightSeq !== null ? 'already inflight' : 'no pending',
+      });
+      return;
+    }
     const { seq, op } = s.pending[0];
     s.inflightSeq = seq;
     s.mySeqs.add(seq);
     const docId = el.doc().value;
+    debug('POST /op send', {
+      seq,
+      op: opSummary(op),
+      wire: opToWire(op, seq, clientId),
+      baseServerVersion: s.serverVersion,
+      baseServerTextHash: textHash(s.serverText),
+      optimisticTextHash: textHash(fullText()),
+    });
     try {
       const r = await fetch(apiUrl('/doc/' + encodeURIComponent(docId) + '/op'), {
         method: 'POST',
@@ -247,12 +341,24 @@
       try {
         const j = await r.json();
         if (typeof j.version === 'number' && Number.isFinite(j.version)) version = j.version;
+        debug('POST /op response body', { seq, body: j });
       } catch (_) {
+        debug('POST /op response had malformed/empty JSON', { seq });
         /* ignore malformed body */
       }
       if (version !== null && version > 0) ackPostIfStillInflight(version, seq);
     } catch (e) {
-      console.error(e);
+      console.error('[DoomDraft] POST /op failed', e);
+      if (s.inflightSeq !== seq || !s.pending.length || s.pending[0].seq !== seq) {
+        debug('POST /op failure ignored: op already resolved', {
+          seq,
+          op: opSummary(op),
+          error: describeFetchFailure(e),
+        });
+        sendPendingFront();
+        return;
+      }
+      debug('POST /op failed', { seq, op: opSummary(op), error: describeFetchFailure(e) });
       setStatus('send failed: ' + describeFetchFailure(e), 'err');
       s.mySeqs.delete(seq);
       s.inflightSeq = null;
@@ -260,15 +366,28 @@
   }
 
   function handleSSEOp(data) {
+    debug('SSE op received', {
+      event: data,
+      eventOp: opSummary(data && data.op),
+      isMine: data && data.client_id === clientId,
+      matchesPendingFront: !!(
+        data && s.pending.length && data.seq === s.pending[0].seq
+      ),
+    });
     // GET /doc/<id> already returns full text at serverVersion. The stream replays
     // all committed ops from version 0 for new connections, so without this
     // guard we would apply every historical op again (reload / second tab breaks).
     if (data.version <= s.serverVersion) {
+      debug('SSE op ignored: stale/duplicate version', {
+        eventVersion: data.version,
+        serverVersion: s.serverVersion,
+      });
       return;
     }
     const ta = el.ta();
-    if (s.pending.length && data.seq === s.pending[0].seq && s.mySeqs.has(data.seq)) {
+    if (s.pending.length && data.seq === s.pending[0].seq && s.mySeqs.has(data.seq) && data.client_id === clientId) {
       const committed = wireToOp(data.op);
+      debug('SSE local ack path', { version: data.version, seq: data.seq, op: opSummary(committed) });
       s.serverText = applyOp(s.serverText, committed);
       s.pending.shift();
       s.mySeqs.delete(data.seq);
@@ -280,8 +399,22 @@
       return;
     }
     const foreign = wireToOp(data.op);
+    debug('SSE foreign apply start', {
+      version: data.version,
+      seq: data.seq,
+      client_id: data.client_id,
+      foreign: opSummary(foreign),
+      pendingBefore: pendingSummary(),
+    });
     for (let i = 0; i < s.pending.length; i++) {
+      const before = s.pending[i].op;
       s.pending[i].op = transform(s.pending[i].op, foreign);
+      debug('pending transformed by foreign op', {
+        pendingSeq: s.pending[i].seq,
+        before: opSummary(before),
+        foreign: opSummary(foreign),
+        after: opSummary(s.pending[i].op),
+      });
     }
     s.serverText = applyOp(s.serverText, foreign);
     s.serverVersion = data.version;
@@ -292,6 +425,11 @@
     try {
       ta.setSelectionRange(c, c);
     } catch (_) {}
+    debug('SSE foreign apply done', {
+      version: data.version,
+      cursorAfter: c,
+      pendingAfter: pendingSummary(),
+    });
   }
 
   function hashColor(id) {
@@ -332,6 +470,7 @@
 
   function handleSSECursor(data) {
     if (data.client_id === clientId) return;
+    debug('SSE cursor received', data);
     s.peerCursors.set(data.client_id, { pos: data.pos, color: hashColor(data.client_id) });
     renderCursorOverlay();
   }
@@ -343,21 +482,35 @@
 
   async function postCursor() {
     if (!s.es) return;
+    if (s.cursorInflight) {
+      s.cursorDirty = true;
+      debug('POST /cursor coalesced', {});
+      return;
+    }
+    s.cursorInflight = true;
+    s.cursorDirty = false;
     const ta = el.ta();
     const pos = ta.selectionStart ?? 0;
     const docId = el.doc().value;
+    debug('POST /cursor send', { pos });
     try {
       await fetch(apiUrl('/doc/' + encodeURIComponent(docId) + '/cursor'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ client_id: clientId, pos }),
       });
-    } catch (_) {}
+    } catch (e) {
+      debug('POST /cursor failed', { pos, error: describeFetchFailure(e) });
+    } finally {
+      s.cursorInflight = false;
+      if (s.cursorDirty && s.es) scheduleCursorPost();
+    }
   }
 
   /** @param {{ reconnecting?: boolean }} [opts] */
   function disconnect(opts) {
     const reconnecting = !!(opts && opts.reconnecting);
+    debug('disconnect', { reconnecting });
     if (s.es) {
       const old = s.es;
       s.es = null;
@@ -370,6 +523,8 @@
     s.pending = [];
     s.mySeqs.clear();
     s.inflightSeq = null;
+    s.cursorInflight = false;
+    s.cursorDirty = false;
     s.peerCursors.clear();
     renderCursorOverlay();
     if (!reconnecting) {
@@ -380,6 +535,7 @@
 
   async function connect() {
     const myGen = ++connectGen;
+    debug('connect start', { generation: myGen, apiRoot: apiRoot() });
     disconnect({ reconnecting: true });
     const docId = el.doc().value.trim();
     if (!docId) {
@@ -399,6 +555,13 @@
       s.inflightSeq = null;
       el.ta().value = fullText();
       el.ver().textContent = 'v ' + s.serverVersion;
+      debug('GET /doc loaded', {
+        generation: myGen,
+        loadedVersion: s.serverVersion,
+        loadedLen: s.serverText.length,
+        loadedHash: textHash(s.serverText),
+        loadedPreview: preview(s.serverText),
+      });
     } catch (e) {
       if (myGen !== connectGen) return;
       console.error(e);
@@ -408,6 +571,7 @@
 
     if (myGen !== connectGen) return;
     const streamUrl = apiUrl('/doc/' + encodeURIComponent(docId) + '/stream');
+    debug('SSE open requested', { streamUrl, generation: myGen });
     const es = new EventSource(streamUrl);
     s.es = es;
     es.addEventListener('op', (ev) => {
@@ -430,12 +594,14 @@
     // fatal failure; avoid flashing "stream error" unless the socket is dead.
     es.onerror = () => {
       if (s.es !== es) return;
+      debug('SSE error', { readyState: es.readyState });
       if (es.readyState === EventSource.CLOSED) {
         setStatus('stream closed', 'err');
       }
     };
     es.onopen = () => {
       if (s.es !== es) return;
+      debug('SSE open', { readyState: es.readyState });
       setStatus('connected', 'ok');
     };
   }
@@ -447,8 +613,19 @@
     const prev = fullText();
     if (cur === prev) return;
     const ops = computeDelta(prev, cur);
+    debug('input delta computed', {
+      prevLen: prev.length,
+      prevHash: textHash(prev),
+      curLen: cur.length,
+      curHash: textHash(cur),
+      selectionStart: ta.selectionStart,
+      ops: ops.map(opSummary),
+      prevPreview: preview(prev),
+      curPreview: preview(cur),
+    });
     for (const op of ops) {
       s.pending.push({ seq: s.nextSeq++, op });
+      debug('pending op enqueued', { seq: s.nextSeq - 1, op: opSummary(op) });
     }
     sendPendingFront();
   }

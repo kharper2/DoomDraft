@@ -1138,17 +1138,29 @@ int main(int argc, char* argv[]) {
 
 #ifdef PT_COLLAB_SERVER
 #include "http_server.hh"
+#include <filesystem>
 
 static struct option server_options[] = {
-    {"port",     required_argument, nullptr, 'p'},
-    {"replicas", required_argument, nullptr, 'n'},
-    {"doc",      required_argument, nullptr, 'd'},
+    {"port",          required_argument, nullptr, 'p'},
+    {"replicas",      required_argument, nullptr, 'n'},
+    {"doc",           required_argument, nullptr, 'd'},
+    {"link-delay-ms", required_argument, nullptr, 'L'},
+    {"send-delay-ms", required_argument, nullptr, 'S'},
+    {"recv-delay-ms", required_argument, nullptr, 'R'},
     {nullptr, 0, nullptr, 0}};
 
 int main(int argc, char* argv[]) {
   uint16_t port = 8080;
   size_t nreplicas = 3;
   std::string doc_id = "main";
+
+  // Server defaults: 0ms across the board. The simulated netsim latency
+  // (5/1/1ms) is irrelevant for an in-process server and triggers Paxos
+  // election storms under wall-clock time. Override via flags if you want
+  // to reproduce bench-like network conditions.
+  unsigned link_delay_ms = 0;
+  unsigned send_delay_ms = 0;
+  unsigned recv_delay_ms = 0;
 
   auto shortopts = short_options_for(server_options);
   int ch;
@@ -1159,13 +1171,28 @@ int main(int argc, char* argv[]) {
       nreplicas = from_str_chars<size_t>(optarg);
     } else if (ch == 'd') {
       doc_id = optarg;
+    } else if (ch == 'L') {
+      link_delay_ms = from_str_chars<unsigned>(optarg);
+    } else if (ch == 'S') {
+      send_delay_ms = from_str_chars<unsigned>(optarg);
+    } else if (ch == 'R') {
+      recv_delay_ms = from_str_chars<unsigned>(optarg);
     } else {
-      std::print(std::cerr, "Usage: pt-collab-server [--port N] [--replicas N] [--doc ID]\n");
+      std::print(std::cerr,
+                 "Usage: pt-collab-server [--port N] [--replicas N] [--doc ID]\n"
+                 "                        [--link-delay-ms N] [--send-delay-ms N] [--recv-delay-ms N]\n");
       return 1;
     }
   }
 
   cot::set_clock(cot::clock::real_time);
+
+  std::filesystem::create_directories("logs");
+  if (!std::freopen("logs/server.log", "a", stderr)) {
+    std::print(std::cerr, "warning: could not redirect server logs to logs/server.log\n");
+  }
+  std::print(std::cerr, "\n[DoomDraft server] ===== server start doc={} replicas={} port={} =====\n",
+             doc_id, nreplicas, port);
 
   testinfo tester;
   tester.loss = 0.0;

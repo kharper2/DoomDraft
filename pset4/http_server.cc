@@ -5,6 +5,7 @@
 #include "doc_state.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <charconv>
@@ -23,6 +24,13 @@
 
 namespace cot = cotamer;
 using namespace std::chrono_literals;
+
+namespace {
+// Global counters for log correlation. Each accepted TCP connection gets a
+// monotonic conn_id; each poll_doc_cache tick gets a monotonic tick_id.
+std::atomic<uint64_t> g_next_conn_id{1};
+std::atomic<uint64_t> g_next_tick_id{1};
+} // namespace
 
 // ---------------------------------------------------------------------------
 // http_client_model
@@ -47,7 +55,13 @@ cot::task<pancy::version_type> http_client_model::submit_put(std::string key,
     uint64_t serial = kMyCid + off * serial_step();
 
     size_t replica = leader_;
+    std::print(stderr,
+               "[DoomDraft server] paxos submit begin key={} value=\"{}\" serial={} start_replica={} leader={}\n",
+               key, value, serial, replica, leader_);
     for (int tries = 0; tries < kMaxAttempts; ++tries) {
+        std::print(stderr,
+                   "[DoomDraft server] paxos submit try={} key={} serial={} replica={}\n",
+                   tries, key, serial, replica);
         co_await send_request<pancy::put_request>(replica, serial, key, value);
         auto resp = co_await cot::attempt(
             receive_response<pancy::put_response>(replica, serial),
@@ -55,7 +69,20 @@ cot::task<pancy::version_type> http_client_model::submit_put(std::string key,
         );
         if (resp && resp->errcode == pancy::errc::ok) {
             leader_ = replica; // sticky leader
+            std::print(stderr,
+                       "[DoomDraft server] paxos submit ok key={} serial={} replica={} version={} previous_version={}\n",
+                       key, serial, replica, resp->version, resp->previous_version);
             co_return resp->version;
+        }
+        if (resp) {
+            std::print(stderr,
+                       "[DoomDraft server] paxos submit non-ok key={} serial={} replica={} errcode={} version={}\n",
+                       key, serial, replica, static_cast<int>(resp->errcode),
+                       resp->version);
+        } else {
+            std::print(stderr,
+                       "[DoomDraft server] paxos submit timeout key={} serial={} replica={}\n",
+                       key, serial, replica);
         }
         // No response, or non-ok: try a different replica next round.
         // receive_response updates `replica` in-place on redirect.
@@ -63,6 +90,9 @@ cot::task<pancy::version_type> http_client_model::submit_put(std::string key,
             replica = (replica + 1) % nreplicas();
         }
     }
+    std::print(stderr,
+               "[DoomDraft server] paxos submit failed key={} serial={} attempts={}\n",
+               key, serial, kMaxAttempts);
     co_return 0;
 }
 
@@ -76,6 +106,10 @@ constexpr std::string_view kDocsRegistryKey = "docs/registry";
 std::string json_escape(std::string_view s);
 std::optional<std::string> json_get_string(std::string_view body, std::string_view key);
 std::optional<int64_t> json_get_int(std::string_view body, std::string_view key);
+std::string preview_text(std::string_view s);
+std::string op_debug_string(const collab::doc_op& op);
+std::string text_debug_string(std::string_view text);
+std::string safe_log_component(std::string_view s);
 
 std::string docs_registry_json(const std::set<std::string>& docs) {
     std::string out = "[";
@@ -127,6 +161,7 @@ struct cursor_entry {
 struct per_doc_cache {
     std::vector<collab::committed_op> ops_;
     std::map<uint64_t, cursor_entry> cursors_;
+    std::map<uint64_t, std::string> client_labels_;
     std::string text_;
     pancy::version_type version_ = 0;
     uint64_t epoch_ = 0;
@@ -135,8 +170,18 @@ struct per_doc_cache {
     void refresh_ops_from_db(const pancy::pancydb& db, std::string_view doc_id) {
         std::vector<collab::committed_op> fresh = collab::read_ops(db, doc_id);
         const pancy::version_type fresh_version = fresh.empty() ? 0 : fresh.back().version;
+        if (fresh.size() != ops_.size()
+            || (!fresh.empty() && fresh_version != version_)) {
+            std::print(stderr,
+                       "[DoomDraft server] cache refresh doc={} fresh_ops={} cached_ops={} fresh_v={} cached_v={} cached_text={}\n",
+                       doc_id, fresh.size(), ops_.size(), fresh_version, version_,
+                       text_debug_string(text_));
+        }
         if (fresh.empty()) {
             if (!ops_.empty()) {
+                std::print(stderr,
+                           "[DoomDraft server] cache reset empty doc={} old_ops={} old_text={}\n",
+                           doc_id, ops_.size(), text_debug_string(text_));
                 ops_.clear();
                 text_.clear();
                 version_ = 0;
@@ -159,7 +204,17 @@ struct per_doc_cache {
         }
         if (append_only) {
             for (size_t i = ops_.size(); i != fresh.size(); ++i) {
+                auto label_it = client_labels_.find(fresh[i].client_id);
+                if (label_it != client_labels_.end()) {
+                    fresh[i].client_id_label = label_it->second;
+                }
+                const std::string before = text_;
                 collab::apply_op(text_, fresh[i].op);
+                std::print(stderr,
+                           "[DoomDraft server] cache append doc={} idx={} version={} cid_hash={} seq={} op={} before={} after={}\n",
+                           doc_id, i, fresh[i].version, fresh[i].client_id,
+                           fresh[i].client_seq, op_debug_string(fresh[i].op),
+                           text_debug_string(before), text_debug_string(text_));
                 ops_.push_back(fresh[i]);
             }
             if (fresh_version != version_) {
@@ -170,8 +225,25 @@ struct per_doc_cache {
         }
 
         // Slow path: recompute full state when prefix changed unexpectedly.
+        // Preserve client_id_label strings learned via note_committed — the DB
+        // only stores the numeric hash, so without this rebuild would flip the
+        // SSE-emitted client_id from "c_..." to a uint64.
+        std::map<std::pair<uint64_t, uint64_t>, std::string> saved_labels;
+        for (const auto& o : ops_) {
+            if (!o.client_id_label.empty()) {
+                saved_labels.emplace(std::make_pair(o.client_id, o.client_seq),
+                                     o.client_id_label);
+            }
+        }
         ops_ = std::move(fresh);
+        for (auto& o : ops_) {
+            auto it = saved_labels.find({o.client_id, o.client_seq});
+            if (it != saved_labels.end()) o.client_id_label = std::move(it->second);
+        }
         text_ = collab::reconstruct(ops_);
+        std::print(stderr,
+                   "[DoomDraft server] cache full rebuild doc={} ops={} version={} text={}\n",
+                   doc_id, ops_.size(), fresh_version, text_debug_string(text_));
         version_ = fresh_version;
         ++epoch_;
     }
@@ -214,19 +286,73 @@ struct per_doc_cache {
             }
         }
         if (changed) {
+            std::print(stderr,
+                       "[DoomDraft server] cursor cache changed doc={} old={} fresh={}\n",
+                       doc_id, cursors_.size(), fresh.size());
             cursors_ = std::move(fresh);
             ++cursor_epoch_;
         }
     }
 
     void note_committed(const collab::committed_op& c) {
-        // Expected hot path: monotonically increasing commit versions.
+        if (!c.client_id_label.empty()) {
+            client_labels_[c.client_id] = c.client_id_label;
+        }
+        std::print(stderr,
+                   "[DoomDraft server] note_committed incoming version={} cid_hash={} cid_label={} seq={} op={} cache_v={} cache_ops={} cache_text={}\n",
+                   c.version, c.client_id,
+                   c.client_id_label.empty() ? "(none)" : c.client_id_label,
+                   c.client_seq, op_debug_string(c.op), version_, ops_.size(),
+                   text_debug_string(text_));
+        // poll_doc_cache may have already inserted this op from the DB without
+        // a client_id_label. Upgrade the existing entry instead of appending a
+        // duplicate row (which would cause SSE to emit the same op twice — once
+        // with the numeric hash, once with the string label).
+        for (auto& existing : ops_) {
+            if (existing.client_id == c.client_id
+                && existing.client_seq == c.client_seq) {
+                if (existing.client_id_label.empty() && !c.client_id_label.empty()) {
+                    existing.client_id_label = c.client_id_label;
+                    std::print(stderr,
+                               "[DoomDraft server] note_committed upgraded label version={} cid_hash={} seq={} label={}\n",
+                               existing.version, existing.client_id,
+                               existing.client_seq, existing.client_id_label);
+                } else {
+                    std::print(stderr,
+                               "[DoomDraft server] note_committed duplicate ignored existing_version={} incoming_version={} cid_hash={} seq={}\n",
+                               existing.version, c.version, c.client_id, c.client_seq);
+                }
+                return;
+            }
+        }
         if (c.version > version_) {
+            const std::string before = text_;
             collab::apply_op(text_, c.op);
             ops_.push_back(c);
             version_ = c.version;
             ++epoch_;
+            std::print(stderr,
+                       "[DoomDraft server] note_committed applied version={} cid_hash={} seq={} before={} after={} epoch={}\n",
+                       c.version, c.client_id, c.client_seq,
+                       text_debug_string(before), text_debug_string(text_), epoch_);
+        } else {
+            std::print(stderr,
+                       "[DoomDraft server] note_committed stale ignored incoming_version={} cache_v={} cid_hash={} seq={}\n",
+                       c.version, version_, c.client_id, c.client_seq);
         }
+    }
+
+    void note_client_label(uint64_t cid_hash, std::string_view label) {
+        if (label.empty()) return;
+        client_labels_[cid_hash] = std::string(label);
+        for (auto& op : ops_) {
+            if (op.client_id == cid_hash && op.client_id_label.empty()) {
+                op.client_id_label = std::string(label);
+            }
+        }
+        std::print(stderr,
+                   "[DoomDraft server] remembered client label cid_hash={} label={} known_labels={}\n",
+                   cid_hash, label, client_labels_.size());
     }
 };
 
@@ -499,6 +625,56 @@ uint64_t hash_client_id(std::string_view s) {
     return h;
 }
 
+uint64_t hash_text(std::string_view s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+std::string preview_text(std::string_view s) {
+    std::string out;
+    size_t n = std::min<size_t>(s.size(), 80);
+    out.reserve(n + 8);
+    for (size_t i = 0; i != n; ++i) {
+        char c = s[i];
+        if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else out.push_back(c);
+    }
+    if (s.size() > n) out += "...";
+    return out;
+}
+
+std::string text_debug_string(std::string_view text) {
+    return std::format("len={} hash={:016x} preview=\"{}\"",
+                       text.size(), hash_text(text), preview_text(text));
+}
+
+std::string op_debug_string(const collab::doc_op& op) {
+    if (const auto* in = std::get_if<collab::insert_op>(&op)) {
+        return std::format("I@{}+{} \"{}\"", in->pos, in->text.size(),
+                           preview_text(in->text));
+    }
+    const auto& dl = std::get<collab::delete_op>(op);
+    return std::format("D@{}x{}", dl.pos, dl.len);
+}
+
+std::string safe_log_component(std::string_view s) {
+    std::string out;
+    out.reserve(std::min<size_t>(s.size(), 80));
+    for (char c : s) {
+        const bool ok = std::isalnum(static_cast<unsigned char>(c))
+                        || c == '_' || c == '-' || c == '.';
+        out.push_back(ok ? c : '_');
+        if (out.size() >= 80) break;
+    }
+    return out.empty() ? "unknown" : out;
+}
+
 // Compose "<status> <reason>\r\n<headers>\r\n\r\n<body>".
 std::string http_response(int status, std::string_view reason,
                           std::string_view content_type,
@@ -538,6 +714,10 @@ cot::task<> serve_static_file(const cot::fd& f, const char* path,
 
 cot::task<> handle_get_doc_id(const cot::fd& f, std::string_view doc_id) {
     auto& cache = g_state.doc(doc_id);
+    std::print(stderr,
+               "[DoomDraft server] GET doc={} cache_v={} ops={} epoch={} text={}\n",
+               doc_id, cache.version_, cache.ops_.size(), cache.epoch_,
+               text_debug_string(cache.text_));
     std::string body = std::format("{{\"text\":\"{}\",\"version\":{}}}",
                                     json_escape(cache.text_), cache.version_);
     co_await write_all(f, http_response(200, "OK", "application/json", body));
@@ -548,6 +728,9 @@ cot::task<> handle_get_doc_id(const cot::fd& f, std::string_view doc_id) {
 cot::task<> handle_post_op_doc(const cot::fd& f, const http_paxos_bridge& bridge,
                                std::string_view doc_id, std::string body) {
     auto started = cot::steady_now();
+    std::print(stderr,
+               "[DoomDraft server] POST op begin doc={} raw_body={}\n",
+               doc_id, body);
     auto type_opt = json_get_string(body, "type");
     auto pos_opt = json_get_int(body, "pos");
     auto cid_opt = json_get_string(body, "client_id");
@@ -593,12 +776,25 @@ cot::task<> handle_post_op_doc(const cot::fd& f, const http_paxos_bridge& bridge
     }
 
     uint64_t hashed_cid = hash_client_id(*cid_opt);
+    g_state.doc(doc_id).note_client_label(hashed_cid, *cid_opt);
     std::string key = collab::op_key(doc_id, hashed_cid,
                                      static_cast<uint64_t>(*seq_opt));
     std::string value = collab::serialize(op);
+    {
+        auto& cache = g_state.doc(doc_id);
+        std::print(stderr,
+                   "[DoomDraft server] POST op parsed doc={} cid_label={} cid_hash={} seq={} key={} op={} serialized=\"{}\" cache_v={} cache_ops={} cache_text={}\n",
+                   doc_id, *cid_opt, hashed_cid, *seq_opt, key,
+                   op_debug_string(op), value, cache.version_, cache.ops_.size(),
+                   text_debug_string(cache.text_));
+    }
 
     pancy::version_type version = co_await bridge.client->submit_put(key, value);
     if (version == 0) {
+        std::print(stderr,
+                   "[DoomDraft server] POST op timeout doc={} cid_label={} cid_hash={} seq={} key={} op={}\n",
+                   doc_id, *cid_opt, hashed_cid, *seq_opt, key,
+                   op_debug_string(op));
         co_await write_all(f, http_response(
             504, "Gateway Timeout", "application/json",
             "{\"error\":\"paxos commit timed out\"}"));
@@ -613,8 +809,10 @@ cot::task<> handle_post_op_doc(const cot::fd& f, const http_paxos_bridge& bridge
     co_await write_all(f, http_response(200, "OK", "application/json", resp_body));
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         cot::steady_now() - started);
-    std::print("POST /doc/{}/op commit version={} latency_ms={}\n",
-               doc_id, version, elapsed_ms.count());
+    std::print(stderr,
+               "[DoomDraft server] POST op done doc={} version={} cid_label={} cid_hash={} seq={} latency_ms={} cache_text={}\n",
+               doc_id, version, *cid_opt, hashed_cid, *seq_opt,
+               elapsed_ms.count(), text_debug_string(cache.text_));
 }
 
 // GET /doc/<id>/stream  ->  text/event-stream forever
@@ -640,6 +838,9 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
     pancy::version_type last_seen = resume_from;
     uint64_t last_cursor_epoch = 0;
     auto last_heartbeat = cot::steady_now();
+    std::print(stderr,
+               "[DoomDraft server] SSE stream open doc={} resume_from={}\n",
+               doc_id, resume_from);
     while (true) {
         auto& cache = g_state.doc(doc_id);
         // Copy before iterating: POST /op (note_committed), POST /cursor, and
@@ -648,9 +849,20 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
         // if another task reallocates — manifests as dropped SSE / "stream
         // error" in the browser as soon as commits race the stream loop.
         const std::vector<collab::committed_op> ops_snap = cache.ops_;
+        if (!ops_snap.empty() && ops_snap.back().version > last_seen) {
+            std::print(stderr,
+                       "[DoomDraft server] SSE scan doc={} last_seen={} cache_v={} snap_ops={} cache_text={}\n",
+                       doc_id, last_seen, cache.version_, ops_snap.size(),
+                       text_debug_string(cache.text_));
+        }
         for (const auto& c : ops_snap) {
             if (c.version <= last_seen) continue;
             const std::string ev = sse_op_frame(c);
+            std::print(stderr,
+                       "[DoomDraft server] SSE emit op doc={} version={} cid_hash={} cid_label={} seq={} op={} last_seen_before={}\n",
+                       doc_id, c.version, c.client_id,
+                       c.client_id_label.empty() ? "(none)" : c.client_id_label,
+                       c.client_seq, op_debug_string(c.op), last_seen);
             if (!co_await write_all(f, ev)) {
                 std::print(std::cerr, "SSE op write failed (doc {})\n", doc_id);
                 co_return;
@@ -660,9 +872,15 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
         const uint64_t epoch_snap = cache.cursor_epoch_;
         const std::map<uint64_t, cursor_entry> cursors_snap = cache.cursors_;
         if (epoch_snap != last_cursor_epoch) {
+            std::print(stderr,
+                       "[DoomDraft server] SSE cursor epoch doc={} old_epoch={} new_epoch={} cursors={}\n",
+                       doc_id, last_cursor_epoch, epoch_snap, cursors_snap.size());
             for (const auto& p : cursors_snap) {
                 const cursor_entry& cur = p.second;
                 const std::string cev = sse_cursor_frame(cur);
+                std::print(stderr,
+                           "[DoomDraft server] SSE emit cursor doc={} cid_hash={} cid_label={} pos={} version={}\n",
+                           doc_id, p.first, cur.client_id, cur.pos, cur.version);
                 if (!co_await write_all(f, cev)) {
                     std::print(std::cerr, "SSE cursor write failed (doc {})\n", doc_id);
                     co_return;
@@ -673,17 +891,23 @@ cot::task<> handle_stream_doc(const cot::fd& f, std::string_view doc_id,
 
         auto now = cot::steady_now();
         if (now - last_heartbeat >= 5s) {   // 5 s — well inside browser idle limits
+            std::print(stderr,
+                       "[DoomDraft server] SSE heartbeat doc={} last_seen={} cache_v={}\n",
+                       doc_id, last_seen, cache.version_);
             if (!co_await write_all(f, std::string("event: ping\ndata: {}\n\n"))) {
                 co_return;
             }
             last_heartbeat = now;
         }
-        co_await cot::after(250ms);
+        co_await cot::after(25ms);
     }
 }
 
 cot::task<> handle_post_cursor_doc(const cot::fd& f, const http_paxos_bridge& bridge,
                                    std::string_view doc_id, std::string body) {
+    std::print(stderr,
+               "[DoomDraft server] POST cursor begin doc={} raw_body={}\n",
+               doc_id, body);
     auto cid = json_get_string(body, "client_id");
     auto pos = json_get_int(body, "pos");
     if (!cid || !pos) {
@@ -699,11 +923,18 @@ cot::task<> handle_post_cursor_doc(const cot::fd& f, const http_paxos_bridge& br
         co_return;
     }
     uint64_t cid_hash = hash_client_id(*cid);
+    g_state.doc(doc_id).note_client_label(cid_hash, *cid);
     std::string key = std::format("doc/{}/cursor/{}", doc_id, cid_hash);
     std::string val = std::format("{{\"client_id\":\"{}\",\"pos\":{}}}",
                                   json_escape(*cid), *pos);
+    std::print(stderr,
+               "[DoomDraft server] POST cursor parsed doc={} cid_label={} cid_hash={} pos={} key={} value={}\n",
+               doc_id, *cid, cid_hash, *pos, key, val);
     pancy::version_type version = co_await bridge.client->submit_put(key, val);
     if (version == 0) {
+        std::print(stderr,
+                   "[DoomDraft server] POST cursor timeout doc={} cid_label={} cid_hash={} pos={}\n",
+                   doc_id, *cid, cid_hash, *pos);
         co_await write_all(f, http_response(
             504, "Gateway Timeout", "application/json",
             "{\"error\":\"paxos commit timed out\"}"));
@@ -711,16 +942,60 @@ cot::task<> handle_post_cursor_doc(const cot::fd& f, const http_paxos_bridge& br
     }
     g_state.doc(doc_id).cursors_[cid_hash] = cursor_entry{version, *cid, *pos};
     g_state.doc(doc_id).cursor_epoch_++;
+    std::print(stderr,
+               "[DoomDraft server] POST cursor done doc={} version={} cid_label={} cid_hash={} pos={} cursor_epoch={}\n",
+               doc_id, version, *cid, cid_hash, *pos,
+               g_state.doc(doc_id).cursor_epoch_);
     co_await write_all(f, http_response(
         200, "OK", "application/json",
         std::format("{{\"version\":{}}}", version)));
 }
 
+cot::task<> handle_post_debug_log(const cot::fd& f, std::string body) {
+    auto cid = json_get_string(body, "clientId");
+    if (!cid) cid = json_get_string(body, "client_id");
+    auto doc = json_get_string(body, "doc");
+    const std::string cid_part = safe_log_component(cid.value_or("unknown"));
+    const std::string doc_part = safe_log_component(doc.value_or("unknown"));
+    const std::string path = std::format("logs/browser-{}-{}.jsonl", doc_part, cid_part);
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        std::print(stderr,
+                   "[DoomDraft server] debug log write failed path={} body={}\n",
+                   path, body);
+        co_await write_all(f, http_response(
+            500, "Internal Server Error", "application/json",
+            "{\"error\":\"could not open debug log\"}"));
+        co_return;
+    }
+    out << body << '\n';
+    std::print(stderr,
+               "[DoomDraft server] browser debug logged path={} bytes={}\n",
+               path, body.size());
+    co_await write_all(f, http_response(
+        204, "No Content", "application/json", ""));
+}
+
 cot::task<> poll_doc_cache(http_paxos_bridge bridge) {
+    auto last_tick_end = cot::steady_now();
     while (true) {
+        const uint64_t tick = g_next_tick_id.fetch_add(1);
+        const auto tick_start = cot::steady_now();
+        const auto gap_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            tick_start - last_tick_end).count();
+        std::print(stderr,
+                   "[DoomDraft server] poll tick={} begin gap_us={} known_docs={}\n",
+                   tick, gap_us, g_state.known_docs_.size());
+
         const auto& db = bridge.current_db();
         if (auto vv = db.get(std::string(kDocsRegistryKey)); vv) {
             auto parsed = parse_docs_registry(vv->value);
+            if (parsed != g_state.known_docs_) {
+                std::print(stderr,
+                           "[DoomDraft server] poll tick={} docs registry version={} value={} parsed_count={} known_count={}\n",
+                           tick, vv->version, vv->value, parsed.size(),
+                           g_state.known_docs_.size());
+            }
             for (const auto& d : parsed) g_state.ensure_doc(d);
         }
         for (const auto& d : g_state.known_docs_) {
@@ -728,6 +1003,13 @@ cot::task<> poll_doc_cache(http_paxos_bridge bridge) {
             cache.refresh_ops_from_db(db, d);
             cache.refresh_cursors_from_db(db, d);
         }
+        const auto tick_end = cot::steady_now();
+        const auto work_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            tick_end - tick_start).count();
+        std::print(stderr,
+                   "[DoomDraft server] poll tick={} end work_us={}\n",
+                   tick, work_us);
+        last_tick_end = tick_end;
         co_await cot::after(100ms);
     }
 }
@@ -747,13 +1029,41 @@ std::optional<std::pair<std::string, std::string>> parse_doc_route(std::string_v
     return {{doc, sub}};
 }
 
+// RAII: fires when the coroutine frame is destroyed, regardless of which
+// co_return path was taken. Gives every connection a paired open/close pair
+// in the log.
+struct conn_close_logger {
+    uint64_t conn_id;
+    std::chrono::steady_clock::time_point start;
+    ~conn_close_logger() {
+        auto dur_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            cot::steady_now() - start).count();
+        std::print(stderr,
+                   "[DoomDraft server] conn={} closed total_us={}\n",
+                   conn_id, dur_us);
+    }
+};
+
 // One TCP connection -> dispatch one request, then close.
-cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
+cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge, uint64_t conn_id) {
+    const auto conn_start = cot::steady_now();
+    conn_close_logger close_log{conn_id, conn_start};
+    std::print(stderr,
+               "[DoomDraft server] conn={} accepted\n", conn_id);
     std::string head_buf = co_await read_request_head(conn);
-    if (head_buf.empty()) co_return;
+    if (head_buf.empty()) {
+        std::print(stderr,
+                   "[DoomDraft server] conn={} closed empty_head\n", conn_id);
+        co_return;
+    }
 
     request_line rl = parse_request_line(head_buf);
-    if (rl.method.empty()) co_return;
+    if (rl.method.empty()) {
+        std::print(stderr,
+                   "[DoomDraft server] conn={} closed unparsable head_len={}\n",
+                   conn_id, head_buf.size());
+        co_return;
+    }
 
     std::string body = head_buf.substr(rl.body_offset);
     std::string head_only = head_buf.substr(0, rl.body_offset);
@@ -769,9 +1079,14 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
     }
 
     auto doc_route = parse_doc_route(rl.path);
+    std::print(stderr,
+               "[DoomDraft server] conn={} dispatch method={} path={} content_length={} body_read={}\n",
+               conn_id, rl.method, rl.path, want, body.size());
     if (doc_route && rl.method == "GET" && doc_route->second.empty()) {
         g_state.ensure_doc(doc_route->first);
         co_await handle_get_doc_id(conn, doc_route->first);
+    } else if (rl.method == "POST" && rl.path == "/debug/log") {
+        co_await handle_post_debug_log(conn, std::move(body));
     } else if (doc_route && rl.method == "POST" && doc_route->second == "op") {
         g_state.ensure_doc(doc_route->first);
         co_await handle_post_op_doc(conn, bridge, doc_route->first, std::move(body));
@@ -793,6 +1108,9 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
         co_await handle_stream_doc(conn, doc_route->first, resume_from);
     } else if (rl.method == "GET" && rl.path == "/docs") {
         std::string body_out = docs_registry_json(g_state.known_docs_);
+        std::print(stderr,
+                   "[DoomDraft server] GET /docs known_count={} body={}\n",
+                   g_state.known_docs_.size(), body_out);
         co_await write_all(conn, http_response(200, "OK",
                                                "application/json", body_out));
     } else if (rl.method == "POST" && rl.path == "/docs") {
@@ -805,6 +1123,9 @@ cot::task<> handle_connection(cot::fd conn, http_paxos_bridge bridge) {
         }
         g_state.ensure_doc(*doc);
         std::string reg = docs_registry_json(g_state.known_docs_);
+        std::print(stderr,
+                   "[DoomDraft server] POST /docs id={} registry={}\n",
+                   *doc, reg);
         pancy::version_type v = co_await bridge.client->submit_put(std::string(kDocsRegistryKey), reg);
         if (v == 0) {
             co_await write_all(conn, http_response(
@@ -900,7 +1221,8 @@ cot::task<> run_http_server(uint16_t port, http_paxos_bridge bridge) {
             std::print(std::cerr, "HTTP accept failed: {}\n", e.what());
             continue;
         }
+        const uint64_t conn_id = g_next_conn_id.fetch_add(1);
         // Detach a per-connection task so the accept loop keeps running.
-        handle_connection(std::move(conn), bridge).detach();
+        handle_connection(std::move(conn), bridge, conn_id).detach();
     }
 }

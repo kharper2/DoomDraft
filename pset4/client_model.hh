@@ -122,7 +122,11 @@ inline cotamer::task<std::optional<Resp>> client_model::receive_response(
             if ((in_serial & client_mask()) != cid) {
                 ++it;
             } else if (in_serial != serial) {
-                it = inq_.erase(it);
+                // Multiple coroutines can wait on the same simulated client id
+                // when the HTTP bridge multiplexes real browser requests. A
+                // response for another serial belongs to another waiter; leave
+                // it queued instead of discarding it.
+                ++it;
             } else if (auto rp = std::get_if<pancy::redirection_response>(&*it)) {
                 replicaid = rp->redirection;
                 it = inq_.erase(it);
