@@ -1,2 +1,5 @@
 .DS_Store
 *.o
+
+# Local server / browser debug captures (not source)
+pset4/logs/
