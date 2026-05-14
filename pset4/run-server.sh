@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wrapper: launch pt-collab-server with stderr/stdout timestamped (μs precision)
-# and tee'd to pset4/logs/server-<UTC>.log. Use this instead of running the
+# and tee'd to pset4/logs/server-<local-date>.log. Use this instead of running the
 # binary directly so every line is wall-clock-correlated and saved for later.
 #
 # Usage:

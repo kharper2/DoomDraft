@@ -5,7 +5,7 @@
 set -e
 BIN=./build/pt-collab
 
-echo "=== OT unit tests ==="
+echo "=== pt-collab --test (doc_state + fixed-seed failure convergence) ==="
 $BIN --test
 
 echo ""
